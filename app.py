@@ -4,17 +4,6 @@ TrackFind — Your Personal AI Music Curator
 A premium, dark-themed Streamlit music recommendation app powered by the
 Google Gen AI SDK (Gemini).
 
-Run locally:
-    pip install -r requirements.txt
-    streamlit run app.py
-
-Deploy on Streamlit Community Cloud:
-    1. Push this repo (app.py + requirements.txt) to GitHub.
-    2. On https://share.streamlit.io, create a new app pointing at app.py.
-    3. In the app's "Secrets" settings, add:
-           GEMINI_API_KEY = "your-real-key-here"
-"""
-
 import os
 import re
 import csv
@@ -40,9 +29,21 @@ from pydantic import BaseModel, Field
 
 APP_TITLE = "🎵 TrackFind — Your Personal AI Music Curator"
 
-# Use gemini-1.5-flash as requested. If your API key only has access to
-# newer model families, swap this string for "gemini-2.5-flash" or similar.
-GEMINI_MODEL = "gemini-1.5-flash"
+# Google retires Gemini model IDs on a rolling basis — gemini-1.5-flash and
+# gemini-2.0-flash have both already been shut down (404 NOT_FOUND on any
+# request). gemini-2.5-flash is the current widely-available default as of
+# June 2026. If you hit a 404 again in the future, just change this one
+# string — everything else in the app is model-agnostic.
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# If GEMINI_MODEL above 404s for your key/account, TrackFind will automatically
+# retry against each of these, in order, before giving up.
+GEMINI_MODEL_FALLBACKS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+]
 
 # ---------------------------------------------------------------------------
 # 🔑 GEMINI API KEY — CONFIGURATION PLACEHOLDER
@@ -400,6 +401,7 @@ def init_session_state():
         "now_playing": None,            # dict: {"Song":..., "Artist":...}
         "last_seed": None,              # SeedTrack as dict
         "has_generated": False,
+        "working_model": None,           # whichever Gemini model actually succeeded
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -591,22 +593,10 @@ Rules:
 """.strip()
 
 
-def get_recommendations(artist: str, title: str, num_recs: int) -> List[dict]:
-    """
-    Calls Gemini with a forced JSON schema (Pydantic) so the response is
-    guaranteed to match: [{"Song":..., "Artist":..., "Reason":...}, ...]
-    """
-    client = get_genai_client()
-    if client is None:
-        raise RuntimeError(
-            "Gemini API key not configured. Add GEMINI_API_KEY to your "
-            "Streamlit secrets or environment variables."
-        )
-
-    prompt = build_recommendation_prompt(artist, title, num_recs)
-
+def _call_gemini_model(client: "genai.Client", model_name: str, prompt: str) -> List[dict]:
+    """Single-shot call against one specific model name. Raises on failure."""
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=model_name,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -628,6 +618,55 @@ def get_recommendations(artist: str, title: str, num_recs: int) -> List[dict]:
         raw_text = re.sub(r"^```(json)?", "", raw_text).rstrip("`").strip()
     data = json.loads(raw_text)
     return data
+
+
+def get_recommendations(artist: str, title: str, num_recs: int) -> List[dict]:
+    """
+    Calls Gemini with a forced JSON schema (Pydantic) so the response is
+    guaranteed to match: [{"Song":..., "Artist":..., "Reason":...}, ...]
+
+    Google periodically retires Gemini model IDs (gemini-1.5-flash and
+    gemini-2.0-flash are both already shut down as of mid-2026). To keep
+    TrackFind resilient to the next retirement wave, this tries GEMINI_MODEL
+    first, then walks GEMINI_MODEL_FALLBACKS on a 404/NOT_FOUND, and remembers
+    whichever model actually worked for the rest of the session.
+    """
+    client = get_genai_client()
+    if client is None:
+        raise RuntimeError(
+            "Gemini API key not configured. Add GEMINI_API_KEY to your "
+            "Streamlit secrets or environment variables."
+        )
+
+    prompt = build_recommendation_prompt(artist, title, num_recs)
+
+    # Try the last-known-good model first (if any), then the configured
+    # default, then the fallback chain — without duplicating attempts.
+    candidates = []
+    sticky_model = st.session_state.get("working_model")
+    for m in [sticky_model, GEMINI_MODEL, *GEMINI_MODEL_FALLBACKS]:
+        if m and m not in candidates:
+            candidates.append(m)
+
+    last_error: Optional[Exception] = None
+    for model_name in candidates:
+        try:
+            result = _call_gemini_model(client, model_name, prompt)
+            st.session_state["working_model"] = model_name
+            return result
+        except Exception as e:
+            error_str = str(e)
+            last_error = e
+            # Only keep trying the next candidate on a "model not found"
+            # style error. Any other error (bad key, quota, network) should
+            # surface immediately instead of silently retrying 4x.
+            if "404" not in error_str and "NOT_FOUND" not in error_str.upper():
+                raise
+
+    raise RuntimeError(
+        f"None of the configured Gemini models are available for this API key "
+        f"(tried: {', '.join(candidates)}). Last error: {last_error}"
+    )
 
 
 # ===========================================================================
@@ -779,7 +818,9 @@ with tab_discover:
                     st.session_state.has_generated = True
                     st.session_state.last_seed = {"artist": seed_artist, "title": seed_title}
                     st.session_state.now_playing = {"Song": seed_title, "Artist": seed_artist}
+                    model_used = st.session_state.get("working_model", GEMINI_MODEL)
                     st.success(f"🎉 Generated {len(results)} recommendations based on '{seed_title or seed_artist}'!")
+                    st.caption(f"Served by `{model_used}`")
                 except RuntimeError as e:
                     st.error(f"⚠️ {e}")
                 except Exception as e:
