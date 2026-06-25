@@ -13,6 +13,12 @@ Deploy on Streamlit Community Cloud:
     2. On https://share.streamlit.io, create a new app pointing at app.py.
     3. In the app's "Secrets" settings, add:
            GEMINI_API_KEY = "your-real-key-here"
+
+           # Optional — enables automatic inline playback for every AI
+           # recommendation (not just pasted YouTube links). Free tier:
+           # ~100 searches/day. Get one at https://console.cloud.google.com/
+           # (enable "YouTube Data API v3", then create an API key).
+           YOUTUBE_API_KEY = "your-youtube-key-here"
 """
 
 import os
@@ -82,6 +88,48 @@ def get_api_key() -> Optional[str]:
 
     if GEMINI_API_KEY_PLACEHOLDER and GEMINI_API_KEY_PLACEHOLDER != "YOUR_GEMINI_API_KEY_HERE":
         return GEMINI_API_KEY_PLACEHOLDER
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 🔑 YOUTUBE DATA API KEY — OPTIONAL CONFIGURATION PLACEHOLDER
+# ---------------------------------------------------------------------------
+# This key is OPTIONAL. Without it, "Now Sampling" falls back to a YouTube
+# search link for AI-recommended tracks (since Gemini only returns song
+# names, never real video URLs). With it, TrackFind resolves each
+# recommendation to a real video and plays it inline automatically.
+#
+# Get a free key in ~2 minutes:
+#   1. https://console.cloud.google.com/ -> create/select a project
+#   2. APIs & Services -> Library -> enable "YouTube Data API v3"
+#   3. APIs & Services -> Credentials -> Create Credentials -> API key
+#
+# Free quota: 10,000 units/day; each search costs 100 units (~100 searches/day).
+#
+# Same priority order as the Gemini key:
+#   1. Streamlit secrets   -> YOUTUBE_API_KEY = "..."
+#   2. Environment variable -> export YOUTUBE_API_KEY="..."
+#   3. The placeholder string below (NOT recommended for production)
+#
+# >>> REPLACE THE LINE BELOW WITH YOUR OWN KEY, OR BETTER YET, USE SECRETS <<<
+YOUTUBE_API_KEY_PLACEHOLDER = "YOUR_YOUTUBE_API_KEY_HERE"
+
+
+def get_youtube_api_key() -> Optional[str]:
+    """Resolve the optional YouTube Data API key from secrets, env, or placeholder."""
+    try:
+        if "YOUTUBE_API_KEY" in st.secrets:
+            return st.secrets["YOUTUBE_API_KEY"]
+    except Exception:
+        pass
+
+    env_key = os.environ.get("YOUTUBE_API_KEY")
+    if env_key:
+        return env_key
+
+    if YOUTUBE_API_KEY_PLACEHOLDER and YOUTUBE_API_KEY_PLACEHOLDER != "YOUR_YOUTUBE_API_KEY_HERE":
+        return YOUTUBE_API_KEY_PLACEHOLDER
 
     return None
 
@@ -566,6 +614,45 @@ def build_youtube_watch_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def search_youtube_video_id(query: str, api_key: str) -> Optional[str]:
+    """
+    Resolves a search query (e.g. "Diljit Dosanjh Do You Know") to a real
+    YouTube video ID using the official YouTube Data API v3 search.list
+    endpoint. Requires a free API key (see YOUTUBE_API_KEY_PLACEHOLDER above).
+
+    Results are cached for 24h per unique query so re-playing the same
+    recommendation doesn't burn additional quota (each search costs 100 of
+    the 10,000 free daily units — roughly 100 searches/day).
+
+    Returns None on any failure (no key, bad key, quota exceeded, network
+    issue, no results) so the UI can fall back to a plain search link.
+    """
+    if not api_key or not query:
+        return None
+    try:
+        import urllib.request
+        import urllib.parse
+
+        params = {
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "maxResults": 1,
+            "key": api_key,
+        }
+        url = "https://www.googleapis.com/youtube/v3/search?" + urllib.parse.urlencode(params)
+        with urllib.request.urlopen(url, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        items = data.get("items", [])
+        if items:
+            return items[0]["id"]["videoId"]
+        return None
+    except Exception:
+        return None
+
+
 # ===========================================================================
 # 7. GEMINI RECOMMENDATION ENGINE
 # ===========================================================================
@@ -864,30 +951,51 @@ with tab_discover:
             st.markdown(f"**{song}**")
             st.markdown(f"<span class='tf-subtle'>{artist}</span>", unsafe_allow_html=True)
 
+            # If we don't already have a confirmed video (e.g. this came from
+            # an AI recommendation or manual typing rather than a pasted
+            # link), try to auto-resolve a real one via the YouTube Data API
+            # — but only if the user has configured that optional key.
+            if not video_id:
+                yt_key = get_youtube_api_key()
+                if yt_key:
+                    query = f"{artist} {song}".strip()
+                    if query:
+                        with st.spinner("Finding video..."):
+                            resolved_id = search_youtube_video_id(query, yt_key)
+                        if resolved_id:
+                            video_id = resolved_id
+                            # Cache the resolution on now_playing so we don't
+                            # re-search on every rerun of the script.
+                            st.session_state.now_playing["video_id"] = resolved_id
+
             if video_id:
                 # We have a real, confirmed YouTube video — this embeds and
                 # plays directly inline.
                 watch_url = build_youtube_watch_url(video_id)
                 st.video(watch_url)
-                st.caption("🔊 Playing the exact video you linked.")
+                st.caption("🔊 Now playing.")
             else:
-                # No confirmed video for AI-recommended / manually-typed
-                # tracks — st.video() cannot play a search-results page, so
-                # we offer a clear, honest link instead of a broken embed.
+                # No confirmed video and no YouTube key configured (or the
+                # search came up empty) — st.video() cannot play a
+                # search-results page, so offer a clear, honest link instead
+                # of a broken embed.
                 query = f"{artist} {song}".strip()
                 search_url = build_youtube_search_url(query) if query else ""
                 st.markdown(
                     """
                     <div class="tf-empty-state" style="padding:1.6rem 1rem;">
                         <span class="tf-emoji">🔎</span>
-                        No direct video linked for this track yet.
+                        No direct video found for this track yet.
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
                 if search_url:
                     st.link_button("🔗 Find & play on YouTube", search_url, use_container_width=True)
-                st.caption("Tip: paste a YouTube link as your seed track to enable inline playback.")
+                if not get_youtube_api_key():
+                    st.caption("Tip: add a free YOUTUBE_API_KEY to enable automatic inline playback for every recommendation.")
+                else:
+                    st.caption("No matching video was found automatically — try the link above.")
         else:
             st.markdown(
                 """
