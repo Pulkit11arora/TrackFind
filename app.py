@@ -398,7 +398,8 @@ class RecommendationList(BaseModel):
 class SeedTrack:
     artist: str = ""
     title: str = ""
-    raw_source: str = ""  # e.g. original YouTube URL, for display/debug
+    raw_source: str = ""   # original pasted YouTube URL, for display/debug
+    video_id: str = ""     # real YouTube video ID, set only when known
 
 
 # ===========================================================================
@@ -546,11 +547,12 @@ def parse_youtube_link(url: str) -> SeedTrack:
 
     raw_title = fetch_youtube_title(video_id)
     if not raw_title:
-        return SeedTrack(raw_source=url)
+        return SeedTrack(raw_source=url, video_id=video_id)
 
     cleaned = clean_youtube_title(raw_title)
     seed = split_artist_title(cleaned)
     seed.raw_source = url
+    seed.video_id = video_id
     return seed
 
 
@@ -559,10 +561,9 @@ def build_youtube_search_url(query: str) -> str:
     return f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
 
 
-def build_youtube_embed_search(artist: str, title: str) -> str:
-    """Build a YouTube search URL used to anchor the playback preview."""
-    query = f"{artist} {title}".strip() if (artist or title) else ""
-    return build_youtube_search_url(query) if query else ""
+def build_youtube_watch_url(video_id: str) -> str:
+    """A real, embeddable YouTube watch URL — safe to pass to st.video()."""
+    return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
 
 
 # ===========================================================================
@@ -764,6 +765,7 @@ with tab_discover:
         )
 
         seed_artist, seed_title = "", ""
+        seed_video_id = ""
 
         if input_mode == "🎤 Artist + Track":
             c1, c2 = st.columns(2)
@@ -781,6 +783,8 @@ with tab_discover:
                 with st.spinner("Parsing YouTube link..."):
                     seed = parse_youtube_link(yt_url)
 
+                seed_video_id = seed.video_id
+
                 if seed.title:
                     seed_artist, seed_title = seed.artist, seed.title
                     st.success(f"✅ Detected: **{seed_title}**" + (f" — *{seed_artist}*" if seed_artist else ""))
@@ -788,8 +792,12 @@ with tab_discover:
                         st.caption("Couldn't separate the artist automatically — feel free to refine below.")
                     seed_artist = st.text_input("Confirm / edit Artist", value=seed_artist, key="yt_artist_confirm")
                     seed_title = st.text_input("Confirm / edit Track Title", value=seed_title, key="yt_title_confirm")
+                elif seed_video_id:
+                    st.warning("⚠️ Found the video but couldn't auto-extract a clean title. Please enter details manually — the original video link will still be used for preview.")
+                    seed_artist = st.text_input("Artist Name (manual)", key="yt_artist_manual")
+                    seed_title = st.text_input("Track Title (manual)", key="yt_title_manual")
                 else:
-                    st.warning("⚠️ Couldn't auto-extract a clean title from that link. Please enter details manually.")
+                    st.warning("⚠️ That doesn't look like a valid YouTube link. Please enter details manually.")
                     seed_artist = st.text_input("Artist Name (manual)", key="yt_artist_manual")
                     seed_title = st.text_input("Track Title (manual)", key="yt_title_manual")
 
@@ -828,7 +836,11 @@ with tab_discover:
                     st.session_state.recommendations = results
                     st.session_state.has_generated = True
                     st.session_state.last_seed = {"artist": seed_artist, "title": seed_title}
-                    st.session_state.now_playing = {"Song": seed_title, "Artist": seed_artist}
+                    st.session_state.now_playing = {
+                        "Song": seed_title,
+                        "Artist": seed_artist,
+                        "video_id": seed_video_id,
+                    }
                     model_used = st.session_state.get("working_model", GEMINI_MODEL)
                     st.success(f"🎉 Generated {len(results)} recommendations based on '{seed_title or seed_artist}'!")
                     st.caption(f"Served by `{model_used}`")
@@ -847,13 +859,35 @@ with tab_discover:
         if now_playing and (now_playing.get("Song") or now_playing.get("Artist")):
             song = now_playing.get("Song", "")
             artist = now_playing.get("Artist", "")
+            video_id = now_playing.get("video_id", "")
+
             st.markdown(f"**{song}**")
             st.markdown(f"<span class='tf-subtle'>{artist}</span>", unsafe_allow_html=True)
 
-            search_url = build_youtube_embed_search(artist, song)
-            if search_url:
-                st.video(search_url)
-            st.caption("🔊 Preview anchored via YouTube search — click through to play the exact track.")
+            if video_id:
+                # We have a real, confirmed YouTube video — this embeds and
+                # plays directly inline.
+                watch_url = build_youtube_watch_url(video_id)
+                st.video(watch_url)
+                st.caption("🔊 Playing the exact video you linked.")
+            else:
+                # No confirmed video for AI-recommended / manually-typed
+                # tracks — st.video() cannot play a search-results page, so
+                # we offer a clear, honest link instead of a broken embed.
+                query = f"{artist} {song}".strip()
+                search_url = build_youtube_search_url(query) if query else ""
+                st.markdown(
+                    """
+                    <div class="tf-empty-state" style="padding:1.6rem 1rem;">
+                        <span class="tf-emoji">🔎</span>
+                        No direct video linked for this track yet.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if search_url:
+                    st.link_button("🔗 Find & play on YouTube", search_url, use_container_width=True)
+                st.caption("Tip: paste a YouTube link as your seed track to enable inline playback.")
         else:
             st.markdown(
                 """
@@ -895,7 +929,7 @@ with tab_discover:
                     )
                 with c_play:
                     if st.button("▶️ Play", key=f"play_{idx}"):
-                        st.session_state.now_playing = {"Song": song, "Artist": artist}
+                        st.session_state.now_playing = {"Song": song, "Artist": artist, "video_id": ""}
                         st.rerun()
                 with c_add:
                     if st.button("➕ Add to Playlist", key=f"add_{idx}"):
@@ -970,7 +1004,11 @@ with tab_vault:
                     )
                 with r2:
                     if st.button("▶️", key=f"vault_play_{i}", help="Preview this track"):
-                        st.session_state.now_playing = {"Song": track.get("Song", ""), "Artist": track.get("Artist", "")}
+                        st.session_state.now_playing = {
+                            "Song": track.get("Song", ""),
+                            "Artist": track.get("Artist", ""),
+                            "video_id": "",
+                        }
                         st.toast("Switched preview — check the Discover tab. 🎧")
                 with r3:
                     if st.button("🗑️", key=f"vault_remove_{i}", help="Remove from vault"):
