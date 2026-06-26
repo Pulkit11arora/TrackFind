@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 
 
 # ===========================================================================
-# 1. STRUCTURAL GLOBAL VARIABLES & CONSTANTS (DEFINED FIRST)
+# 1. CORE LAYOUT VARIABLES & CONSTANTS
 # ===========================================================================
 
 APP_TITLE = "🎵 TrackFind — Your Personal AI Music Curator"
@@ -77,6 +77,130 @@ NOISE_SEGMENT_PATTERNS = [
 ]
 NOISE_SEGMENT_REGEX = re.compile("|".join(NOISE_SEGMENT_PATTERNS), flags=re.IGNORECASE)
 
+CUSTOM_CSS = """
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap');
+
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header[data-testid="stHeader"] {background: transparent;}
+
+    .stApp {
+        background: radial-gradient(circle at 10% 0%, #132022 0%, #0b0f10 45%, #08090a 100%);
+        color: #E6F1EE;
+    }
+    .tf-hero {
+        padding: 2.1rem 2.4rem;
+        border-radius: 22px;
+        background: linear-gradient(135deg, rgba(16,185,129,0.16) 0%, rgba(15,23,23,0.65) 60%);
+        border: 1px solid rgba(16,185,129,0.25);
+        box-shadow: 0 8px 32px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.03);
+        margin-bottom: 1.6rem;
+        position: relative;
+        overflow: hidden;
+    }
+    .tf-hero h1 {
+        font-family: 'Space Grotesk', sans-serif;
+        font-size: 2.1rem;
+        font-weight: 700;
+        margin: 0;
+        letter-spacing: -0.5px;
+        background: linear-gradient(90deg, #34d399 0%, #a7f3d0 50%, #6ee7b7 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .tf-hero p { margin: 0.45rem 0 0 0; color: #9CB8B0; font-size: 0.98rem; }
+    .tf-card {
+        background: linear-gradient(155deg, rgba(255,255,255,0.035) 0%, rgba(255,255,255,0.012) 100%);
+        border: 1px solid rgba(255,255,255,0.07);
+        border-radius: 18px;
+        padding: 1.4rem 1.5rem;
+        margin-bottom: 1.1rem;
+    }
+    .tf-card-title {
+        font-family: 'Space Grotesk', sans-serif;
+        font-weight: 600;
+        color: #6EE7B7;
+        margin-bottom: 0.65rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        font-size: 0.82rem;
+    }
+    .tf-track {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.06);
+        border-left: 3px solid #10B981;
+        border-radius: 14px;
+        padding: 0.95rem 1.15rem;
+        margin-bottom: 0.65rem;
+    }
+    .tf-track-song { font-weight: 700; font-size: 1.02rem; color: #F0FDF9; margin: 0; }
+    .tf-track-artist { color: #6EE7B7; font-weight: 500; font-size: 0.86rem; margin: 0.1rem 0 0.4rem 0; }
+    .tf-track-reason { color: #9CB8B0; font-size: 0.84rem; font-style: italic; margin: 0; }
+    .tf-badge {
+        display: inline-block;
+        background: rgba(16,185,129,0.15);
+        color: #6EE7B7;
+        border: 1px solid rgba(16,185,129,0.35);
+        font-size: 0.68rem;
+        font-weight: 700;
+        padding: 0.15rem 0.55rem;
+        border-radius: 999px;
+        margin-bottom: 0.4rem;
+    }
+    .tf-candidate {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.07);
+        border-radius: 12px;
+        padding: 0.6rem 0.8rem;
+        margin-bottom: 0.4rem;
+        display: flex;
+        align-items: center;
+        gap: 0.7rem;
+    }
+    .tf-candidate img { border-radius: 8px; width: 64px; height: 48px; object-fit: cover; }
+    .tf-candidate-title { font-weight: 600; font-size: 0.88rem; color: #F0FDF9; margin: 0; }
+    .tf-candidate-channel { font-size: 0.74rem; color: #7E978F; margin: 0; }
+    .tf-confidence-pill {
+        display: inline-block;
+        font-size: 0.66rem;
+        font-weight: 700;
+        padding: 0.1rem 0.5rem;
+        border-radius: 999px;
+        text-transform: uppercase;
+        margin-left: 0.4rem;
+    }
+    .tf-confidence-high { background: rgba(16,185,129,0.15); color: #6EE7B7; border: 1px solid rgba(16,185,129,0.35); }
+    .tf-confidence-refined { background: rgba(167,139,250,0.15); color: #C4B5FD; border: 1px solid rgba(167,139,250,0.35); }
+    
+    .stButton > button {
+        border-radius: 10px !important;
+        border: 1px solid rgba(16,185,129,0.4) !important;
+        background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(16,185,129,0.06)) !important;
+        color: #6EE7B7 !important;
+        font-weight: 600 !important;
+    }
+    .stButton > button:hover {
+        background: linear-gradient(135deg, #10B981, #059669) !important;
+        color: #06120D !important;
+    }
+    .tf-primary-btn .stButton > button {
+        background: linear-gradient(135deg, #10B981, #059669) !important;
+        color: #06120D !important;
+        font-weight: 700 !important;
+    }
+    .tf-search-btn .stButton > button {
+        background: rgba(110,231,183,0.1) !important;
+        color: #6EE7B7 !important;
+        border: 1px dashed rgba(110,231,183,0.45) !important;
+    }
+    .stTextInput input, .stTextArea textarea { background: rgba(255,255,255,0.04) !important; border: 1px solid rgba(255,255,255,0.1) !important; color: #F0FDF9 !important; }
+    .tf-stat-chip { display: inline-block; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); border-radius: 10px; padding: 0.5rem 1rem; color: #6EE7B7; font-weight: 700; }
+    .tf-stat-chip span { display: block; font-size: 0.68rem; color: #9CB8B0; }
+</style>
+"""
+
 
 # ===========================================================================
 # 2. DATA MODELS
@@ -107,23 +231,7 @@ class SeedTrack:
 
 
 # ===========================================================================
-# 3. INTERFACE FORMATTING & DESIGN HELPERS
-# ===========================================================================
-
-def render_hero():
-    st.markdown(
-        f"""
-        <div class="tf-hero">
-            <h1>{APP_TITLE}</h1>
-            <p>Discover your next favorite track — powered by Gemini AI, styled for the way you actually listen.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# ===========================================================================
-# 4. RESOLUTION PIPELINES (API & CORE DATA KEYS)
+# 3. INTERFACE FORMATTING & SETUP PIPELINES
 # ===========================================================================
 
 def get_api_key() -> Optional[str]:
@@ -164,8 +272,20 @@ def get_genai_client() -> Optional[genai.Client]:
         return None
 
 
+def render_hero():
+    st.markdown(
+        f"""
+        <div class="tf-hero">
+            <h1>{APP_TITLE}</h1>
+            <p>Discover your next favorite track — powered by Gemini AI, styled for the way you actually listen.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # ===========================================================================
-# 5. PARSING, METADATA ISOLATION, & CONTEXTUAL FILTERING
+# 4. PARSING, METADATA ISOLATION, & CONTEXTUAL FILTERING
 # ===========================================================================
 
 def extract_youtube_id(url: str) -> Optional[str]:
@@ -185,19 +305,6 @@ def fetch_youtube_title(video_id: str) -> Optional[str]:
             return data.get("title")
     except Exception:
         return None
-
-
-def clean_youtube_title(raw_title: str) -> str:
-    if not raw_title:
-        return ""
-    cleaned = FLUFF_REGEX.sub("", raw_title)
-    cleaned = re.sub(r"\(\s*\)", "", cleaned)
-    cleaned = re.sub(r"\[\s*\]", "", cleaned)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)
-    cleaned = re.sub(r"\s*[-|]\s*$", "", cleaned)
-    cleaned = re.sub(r"^\s*[-|]\s*", "", cleaned)
-    cleaned = cleaned.strip(" -|·•").strip()
-    return cleaned
 
 
 def _is_structurally_complex(cleaned_title: str) -> bool:
@@ -508,6 +615,9 @@ def playlist_to_markdown() -> str:
 
 # Inject customized visual theme container definitions
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# Initialize Session State
+init_session_state()
 
 # Render main app header dashboard elements
 render_hero()
