@@ -14,11 +14,25 @@ Deploy on Streamlit Community Cloud:
     3. In the app's "Secrets" settings, add:
            GEMINI_API_KEY = "your-real-key-here"
 
-           # Optional — enables automatic inline playback for every AI
-           # recommendation (not just pasted YouTube links). Free tier:
-           # ~100 searches/day. Get one at https://console.cloud.google.com/
+           # Optional — enables (a) automatic inline playback for every AI
+           # recommendation, and (b) the "🔍 Search Track" verification step
+           # under Artist + Track mode. Free tier: ~100 searches/day.
+           # Get one at https://console.cloud.google.com/
            # (enable "YouTube Data API v3", then create an API key).
            YOUTUBE_API_KEY = "your-youtube-key-here"
+
+QA / PM CHANGELOG (this revision):
+    [FEATURE] Artist + Track mode now has an explicit "🔍 Search Track"
+              confirmation step — matches are shown as selectable cards
+              before any recommendation is generated.
+    [BUG FIX] Pasting a YouTube link now updates the "Now Sampling" player
+              immediately on parse, instead of waiting for the user to click
+              "Generate Recommendations".
+    [BUG FIX] YouTube title parsing is now tiered: a fast regex pass handles
+              simple "Artist - Title" uploads; complex multi-segment titles
+              (multiple pipes/dashes, e.g. corporate Bollywood/Punjabi
+              uploads) are flagged low-confidence and refined with a tiny
+              Gemini call so Artist/Title no longer get scrambled.
 """
 
 import os
@@ -95,10 +109,14 @@ def get_api_key() -> Optional[str]:
 # ---------------------------------------------------------------------------
 # 🔑 YOUTUBE DATA API KEY — OPTIONAL CONFIGURATION PLACEHOLDER
 # ---------------------------------------------------------------------------
-# This key is OPTIONAL. Without it, "Now Sampling" falls back to a YouTube
-# search link for AI-recommended tracks (since Gemini only returns song
-# names, never real video URLs). With it, TrackFind resolves each
-# recommendation to a real video and plays it inline automatically.
+# This key is OPTIONAL but unlocks two features:
+#   (a) The "🔍 Search Track" verification step in Artist + Track mode.
+#   (b) Automatic inline playback for AI-recommended tracks (not just pasted
+#       links), since Gemini only ever returns song names, never URLs.
+#
+# Without it, both features degrade gracefully: search becomes a manual
+# confirmation step instead of real candidates, and playback falls back to
+# a "Find & play on YouTube" link button.
 #
 # Get a free key in ~2 minutes:
 #   1. https://console.cloud.google.com/ -> create/select a project
@@ -215,7 +233,6 @@ CUSTOM_CSS = """
     }
     .tf-card-title {
         font-family: 'Space Grotesk', sans-serif;
-        font-size: 1.02rem;
         font-weight: 600;
         color: #6EE7B7;
         margin-bottom: 0.65rem;
@@ -289,6 +306,62 @@ CUSTOM_CSS = """
     .tf-vault-row span.tf-vault-title { font-weight: 600; color: #F0FDF9; }
     .tf-vault-row span.tf-vault-artist { color: #6EE7B7; font-size: 0.85rem; }
 
+    /* ---------- Search-result candidate card (Feature 1) ---------- */
+    .tf-candidate {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.07);
+        border-radius: 12px;
+        padding: 0.6rem 0.8rem;
+        margin-bottom: 0.4rem;
+        display: flex;
+        align-items: center;
+        gap: 0.7rem;
+        transition: all 0.15s ease;
+    }
+    .tf-candidate:hover {
+        border-color: rgba(16,185,129,0.4);
+        background: rgba(16,185,129,0.06);
+    }
+    .tf-candidate img {
+        border-radius: 8px;
+        width: 64px;
+        height: 48px;
+        object-fit: cover;
+        flex-shrink: 0;
+    }
+    .tf-candidate-title {
+        font-weight: 600;
+        font-size: 0.88rem;
+        color: #F0FDF9;
+        line-height: 1.25;
+        margin: 0;
+    }
+    .tf-candidate-channel {
+        font-size: 0.74rem;
+        color: #7E978F;
+        margin: 0.1rem 0 0 0;
+    }
+    .tf-confidence-pill {
+        display: inline-block;
+        font-size: 0.66rem;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+        padding: 0.1rem 0.5rem;
+        border-radius: 999px;
+        text-transform: uppercase;
+        margin-left: 0.4rem;
+    }
+    .tf-confidence-high {
+        background: rgba(16,185,129,0.15);
+        color: #6EE7B7;
+        border: 1px solid rgba(16,185,129,0.35);
+    }
+    .tf-confidence-refined {
+        background: rgba(167,139,250,0.15);
+        color: #C4B5FD;
+        border: 1px solid rgba(167,139,250,0.35);
+    }
+
     /* ---------- Buttons ---------- */
     .stButton > button {
         border-radius: 10px !important;
@@ -326,6 +399,18 @@ CUSTOM_CSS = """
         width: 100%;
         border: none !important;
         box-shadow: 0 0 24px rgba(16,185,129,0.3) !important;
+    }
+
+    /* Secondary CTA (Search Track) */
+    .tf-search-btn .stButton > button {
+        background: linear-gradient(135deg, rgba(110,231,183,0.16), rgba(16,185,129,0.05)) !important;
+        color: #6EE7B7 !important;
+        font-weight: 700 !important;
+        width: 100%;
+        border: 1px dashed rgba(110,231,183,0.45) !important;
+    }
+    .tf-search-btn .stButton > button:hover {
+        border-style: solid !important;
     }
 
     /* ---------- Inputs ---------- */
@@ -442,12 +527,19 @@ class RecommendationList(BaseModel):
     recommendations: List[RecommendedTrack]
 
 
+class ParsedTitle(BaseModel):
+    """Strict schema for the Gemini micro-parse fallback (Bug Fix #3)."""
+    artist: str = Field(description="The primary recording artist's name only — no featured artists, no album/playlist names, no promotional text.")
+    title: str = Field(description="The actual song title only — no movie/album name, no language or genre tags, no promotional text.")
+
+
 @dataclass
 class SeedTrack:
     artist: str = ""
     title: str = ""
     raw_source: str = ""   # original pasted YouTube URL, for display/debug
     video_id: str = ""     # real YouTube video ID, set only when known
+    parse_confidence: str = "high"  # "high" (simple regex) or "refined" (Gemini-assisted)
 
 
 # ===========================================================================
@@ -458,10 +550,14 @@ def init_session_state():
     defaults = {
         "recommendations": [],          # list of dicts: Song, Artist, Reason
         "playlist_vault": [],           # list of dicts: Song, Artist, Reason
-        "now_playing": None,            # dict: {"Song":..., "Artist":...}
+        "now_playing": None,            # dict: {"Song":..., "Artist":..., "video_id":...}
         "last_seed": None,              # SeedTrack as dict
         "has_generated": False,
-        "working_model": None,           # whichever Gemini model actually succeeded
+        "working_model": None,          # whichever Gemini model actually succeeded
+        "search_candidates": [],        # list of dicts from YouTube search, for Feature 1
+        "confirmed_seed": None,         # dict: {"artist":..., "title":..., "video_id":...} once user confirms a candidate
+        "last_search_query": "",        # tracks what the candidates were searched for
+        "search_performed": False,      # persists across reruns (fixes a transient-button-state bug)
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -503,6 +599,10 @@ FLUFF_PATTERNS = [
     r"\[\s*4k\s*\]",
     r"\(\s*hq\s*\)",
     r"\[\s*hq\s*\]",
+    r"\(\s*full\s*video\s*\)",
+    r"\[\s*full\s*video\s*\]",
+    r"\(\s*full\s*song\s*\)",
+    r"\[\s*full\s*song\s*\]",
     r"\bofficial\s*video\b",
     r"\bofficial\s*audio\b",
     r"\bofficial\s*music\s*video\b",
@@ -514,6 +614,7 @@ FLUFF_PATTERNS = [
     r"\b4k\b",
     r"\bhd\b",
     r"\bhq\b",
+    r"\bfull\s*video\b",
     r"\bremastered\b",
     r"\bclean\s*version\b",
     r"\bexplicit\s*version\b",
@@ -522,6 +623,15 @@ FLUFF_PATTERNS = [
 ]
 
 FLUFF_REGEX = re.compile("|".join(FLUFF_PATTERNS), flags=re.IGNORECASE)
+
+# Whole-segment noise — matches an ENTIRE pipe/dash-delimited segment that is
+# pure metadata cruft (not just a substring within a meaningful segment).
+# Used only in the multi-segment (Tier B) parsing path.
+NOISE_SEGMENT_PATTERNS = [
+    r"^(latest|new|hit|top|best)?\s*(punjabi|hindi|bollywood|english|haryanvi)?\s*song(s)?\s*\d*$",
+    r"^official\s*(video|audio)?$",
+]
+NOISE_SEGMENT_REGEX = re.compile("|".join(NOISE_SEGMENT_PATTERNS), flags=re.IGNORECASE)
 
 
 def extract_youtube_id(url: str) -> Optional[str]:
@@ -552,15 +662,14 @@ def fetch_youtube_title(video_id: str) -> Optional[str]:
 def clean_youtube_title(raw_title: str) -> str:
     """
     Strip common YouTube fluff like 'Official Video', 'HD', '4K', 'Lyrics',
-    '[Official Audio]' etc., leaving a clean candidate track name.
+    '[Official Audio]' etc., leaving a clean candidate track string. This is
+    intentionally conservative — it removes known noise tokens but does NOT
+    attempt to split Artist/Title (see split_artist_title below for that).
     """
     if not raw_title:
         return ""
 
-    cleaned = raw_title
-
-    # Remove bracketed/parenthesized fluff and bare fluff keywords
-    cleaned = FLUFF_REGEX.sub("", cleaned)
+    cleaned = FLUFF_REGEX.sub("", raw_title)
 
     # Remove any now-empty bracket/paren pairs left behind
     cleaned = re.sub(r"\(\s*\)", "", cleaned)
@@ -575,20 +684,123 @@ def clean_youtube_title(raw_title: str) -> str:
     return cleaned
 
 
+def _is_structurally_complex(cleaned_title: str) -> bool:
+    """
+    Decides whether a cleaned title is simple enough for pure regex, or
+    complex enough to need the Gemini micro-parse fallback (Bug Fix #3).
+
+    "Complex" = 2 or more pipe characters, OR a mix of pipes AND dashes,
+    OR 3+ total separators of any kind. These are the corporate-upload
+    patterns (e.g. "Artist | Album | Latest Punjabi Song — Title") where a
+    fixed-position regex split reliably grabs the wrong segment.
+    """
+    pipe_count = cleaned_title.count("|")
+    dash_count = len(re.findall(r"\s[-–—]\s", cleaned_title))
+    total_separators = pipe_count + dash_count
+    return pipe_count >= 2 or (pipe_count >= 1 and dash_count >= 1) or total_separators >= 3
+
+
+def split_artist_title_regex(cleaned_title: str) -> SeedTrack:
+    """
+    TIER A — fast, free regex split for simple, unambiguous titles.
+
+    Handles the common "Artist - Title" / "Artist | Title" case directly.
+    For anything structurally complex (see _is_structurally_complex), this
+    still produces a best-effort guess, but flags parse_confidence="low" so
+    the caller knows to attempt a Gemini refinement instead of trusting it.
+    """
+    if not cleaned_title:
+        return SeedTrack(artist="", title="", parse_confidence="high")
+
+    if not _is_structurally_complex(cleaned_title):
+        # Simple case: split on the FIRST separator found.
+        for sep_pattern in [r"\s+[-–—]\s+", r"\s*\|\s*"]:
+            match = re.search(sep_pattern, cleaned_title)
+            if match:
+                idx = match.start()
+                artist = cleaned_title[:idx].strip()
+                title = cleaned_title[match.end():].strip()
+                if artist and title:
+                    return SeedTrack(artist=artist, title=title, parse_confidence="high")
+        return SeedTrack(artist="", title=cleaned_title.strip(), parse_confidence="high")
+
+    # TIER B fallback heuristic (used only if Gemini refinement is
+    # unavailable) — segment-based best guess, explicitly low-confidence.
+    segments = re.split(r"\s*\|\s*|\s+[-–—]\s+", cleaned_title)
+    segments = [s.strip() for s in segments if s.strip()]
+
+    if len(segments) <= 1:
+        return SeedTrack(artist="", title=cleaned_title.strip(), parse_confidence="low")
+
+    meaningful = [s for s in segments if not NOISE_SEGMENT_REGEX.match(s)]
+    if not meaningful:
+        meaningful = segments
+
+    title_guess = meaningful[-1].strip()
+    artist_segment = meaningful[0].strip()
+    artist_guess = artist_segment.split(",")[0].strip() if "," in artist_segment else artist_segment
+
+    return SeedTrack(artist=artist_guess, title=title_guess, parse_confidence="low")
+
+
 def split_artist_title(cleaned_title: str) -> SeedTrack:
-    """
-    Attempt to split a cleaned 'Artist - Title' string into components.
-    Falls back to treating the whole string as the title if no separator
-    is found.
-    """
-    for sep in [" - ", " – ", " — ", " | "]:
-        if sep in cleaned_title:
-            parts = cleaned_title.split(sep, 1)
-            return SeedTrack(artist=parts[0].strip(), title=parts[1].strip())
-    return SeedTrack(artist="", title=cleaned_title.strip())
+    """Backwards-compatible wrapper name used elsewhere in the app."""
+    return split_artist_title_regex(cleaned_title)
 
 
-def parse_youtube_link(url: str) -> SeedTrack:
+def refine_title_with_gemini(messy_title: str) -> Optional[ParsedTitle]:
+    """
+    TIER C — micro Gemini call used ONLY when the regex split was flagged
+    low-confidence (structurally complex titles like multi-pipe corporate
+    uploads). This is a tiny, cheap, single-purpose call distinct from the
+    main recommendation engine — it does not consume the recommendation
+    model-fallback chain and fails silently (returns None) so callers always
+    have the regex guess as a safety net.
+    """
+    client = get_genai_client()
+    if client is None:
+        return None
+
+    prompt = f"""
+Extract the real recording artist and the real song title from this messy
+YouTube video title. Ignore featured/secondary artists, album or movie
+names, playlist names, language/genre tags (e.g. "Latest Punjabi Song"),
+and any promotional text.
+
+Raw title: "{messy_title}"
+
+Return only the primary artist and the actual song title.
+""".strip()
+
+    try:
+        response = client.models.generate_content(
+            model=st.session_state.get("working_model") or GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ParsedTitle,
+                temperature=0.1,
+                max_output_tokens=256,
+            ),
+        )
+        parsed = getattr(response, "parsed", None)
+        if parsed:
+            return parsed
+        raw = (response.text or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(json)?", "", raw).rstrip("`").strip()
+        data = json.loads(raw)
+        return ParsedTitle(**data)
+    except Exception:
+        return None
+
+
+def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
+    """
+    Full pipeline: extract video ID -> fetch raw title -> clean fluff ->
+    split into artist/title (Tier A regex) -> if flagged low-confidence and
+    a Gemini client is available, refine with a micro-call (Tier C).
+    """
     video_id = extract_youtube_id(url)
     if not video_id:
         return SeedTrack(raw_source=url)
@@ -598,9 +810,17 @@ def parse_youtube_link(url: str) -> SeedTrack:
         return SeedTrack(raw_source=url, video_id=video_id)
 
     cleaned = clean_youtube_title(raw_title)
-    seed = split_artist_title(cleaned)
+    seed = split_artist_title_regex(cleaned)
     seed.raw_source = url
     seed.video_id = video_id
+
+    if seed.parse_confidence == "low" and allow_gemini_refine and get_api_key():
+        refined = refine_title_with_gemini(cleaned)
+        if refined and refined.artist and refined.title:
+            seed.artist = refined.artist
+            seed.title = refined.title
+            seed.parse_confidence = "refined"
+
     return seed
 
 
@@ -617,19 +837,32 @@ def build_youtube_watch_url(video_id: str) -> str:
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def search_youtube_video_id(query: str, api_key: str) -> Optional[str]:
     """
-    Resolves a search query (e.g. "Diljit Dosanjh Do You Know") to a real
-    YouTube video ID using the official YouTube Data API v3 search.list
-    endpoint. Requires a free API key (see YOUTUBE_API_KEY_PLACEHOLDER above).
+    Resolves a search query to a single best-match real YouTube video ID
+    using the official YouTube Data API v3 search.list endpoint. Used for
+    auto-resolving playback on AI recommendations (no key = graceful None).
+    """
+    results = search_youtube_tracks(query, api_key, max_results=1)
+    return results[0]["video_id"] if results else None
 
-    Results are cached for 24h per unique query so re-playing the same
-    recommendation doesn't burn additional quota (each search costs 100 of
-    the 10,000 free daily units — roughly 100 searches/day).
 
-    Returns None on any failure (no key, bad key, quota exceeded, network
-    issue, no results) so the UI can fall back to a plain search link.
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def search_youtube_tracks(query: str, api_key: str, max_results: int = 5) -> List[dict]:
+    """
+    [FEATURE 1] Resolves a search query to multiple candidate videos via the
+    official YouTube Data API v3 search.list endpoint, so the user can
+    explicitly confirm which exact track they mean before generating
+    recommendations.
+
+    Returns a list of dicts: {video_id, title, channel, thumbnail}.
+    Returns an empty list on any failure (no key, bad key, quota exceeded,
+    network issue, no results) so the UI can degrade to a manual
+    confirmation step instead of crashing.
+
+    Results are cached for 24h per unique (query, max_results) pair to
+    conserve the free 100-searches/day quota.
     """
     if not api_key or not query:
-        return None
+        return []
     try:
         import urllib.request
         import urllib.parse
@@ -638,19 +871,28 @@ def search_youtube_video_id(query: str, api_key: str) -> Optional[str]:
             "part": "snippet",
             "q": query,
             "type": "video",
-            "maxResults": 1,
+            "maxResults": max(1, min(max_results, 10)),
             "key": api_key,
         }
         url = "https://www.googleapis.com/youtube/v3/search?" + urllib.parse.urlencode(params)
         with urllib.request.urlopen(url, timeout=6) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
-        items = data.get("items", [])
-        if items:
-            return items[0]["id"]["videoId"]
-        return None
+        results = []
+        for item in data.get("items", []):
+            vid = item.get("id", {}).get("videoId")
+            if not vid:
+                continue
+            snippet = item.get("snippet", {})
+            results.append({
+                "video_id": vid,
+                "title": snippet.get("title", "Untitled"),
+                "channel": snippet.get("channelTitle", ""),
+                "thumbnail": snippet.get("thumbnails", {}).get("default", {}).get("url", ""),
+            })
+        return results
     except Exception:
-        return None
+        return []
 
 
 # ===========================================================================
@@ -849,36 +1091,226 @@ with tab_discover:
             options=["🎤 Artist + Track", "🔗 YouTube Link"],
             horizontal=True,
             label_visibility="collapsed",
+            key="input_mode_radio",
         )
+
+        # Reset the confirmed seed if the user switches input modes, so a
+        # confirmation from one mode doesn't leak into the other.
+        if st.session_state.get("_last_input_mode") != input_mode:
+            st.session_state.confirmed_seed = None
+            st.session_state.search_candidates = []
+            st.session_state.search_performed = False
+            st.session_state["_last_input_mode"] = input_mode
 
         seed_artist, seed_title = "", ""
         seed_video_id = ""
 
+        # ===================================================================
+        # MODE A: 🎤 Artist + Track  ([FEATURE] Search & Verify)
+        # ===================================================================
         if input_mode == "🎤 Artist + Track":
             c1, c2 = st.columns(2)
             with c1:
-                seed_artist = st.text_input("Artist Name", placeholder="e.g. The Weeknd")
+                typed_artist = st.text_input("Artist Name", placeholder="e.g. The Weeknd", key="typed_artist")
             with c2:
-                seed_title = st.text_input("Track Title", placeholder="e.g. Blinding Lights")
+                typed_title = st.text_input("Track Title", placeholder="e.g. Blinding Lights", key="typed_title")
 
+            st.markdown('<div class="tf-search-btn">', unsafe_allow_html=True)
+            search_clicked = st.button("🔍 Search Track", use_container_width=True, key="search_track_btn")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            yt_key = get_youtube_api_key()
+
+            # NOTE: `search_clicked` is only True on the exact script run where
+            # the button was pressed — it resets to False on every later rerun
+            # (e.g. when the user types into a fallback confirm field below).
+            # We persist the "a search was performed" state separately so the
+            # results/fallback UI doesn't vanish the instant the user
+            # interacts with anything else on the page.
+            if search_clicked:
+                query = f"{typed_artist} {typed_title}".strip()
+                if not query:
+                    st.error("Type an artist name and/or track title before searching.")
+                    st.session_state.search_performed = False
+                else:
+                    st.session_state.confirmed_seed = None
+                    st.session_state.last_search_query = query
+                    st.session_state.search_performed = True
+                    if yt_key:
+                        with st.spinner("Searching for matching tracks..."):
+                            candidates = search_youtube_tracks(query, yt_key, max_results=5)
+                        st.session_state.search_candidates = candidates
+                    else:
+                        # No YouTube key — smart fallback: skip real search,
+                        # treat the typed values as a single confirmable
+                        # candidate so the verification step still exists.
+                        st.session_state.search_candidates = []
+
+            search_performed = st.session_state.get("search_performed", False)
+
+            # ---- Render candidate results (real search) ----
+            if st.session_state.search_candidates:
+                st.caption(f"Top matches for **{st.session_state.last_search_query}** — confirm the exact track:")
+                option_labels = []
+                for cand in st.session_state.search_candidates:
+                    option_labels.append(f"{cand['title']}  ·  {cand['channel']}")
+
+                chosen_label = st.radio(
+                    "Select the exact track",
+                    options=option_labels,
+                    label_visibility="collapsed",
+                    key="candidate_radio",
+                )
+                chosen_idx = option_labels.index(chosen_label) if chosen_label in option_labels else 0
+                chosen = st.session_state.search_candidates[chosen_idx]
+
+                # Show a small thumbnail preview card for the highlighted pick
+                st.markdown(
+                    f"""
+                    <div class="tf-candidate">
+                        <img src="{chosen['thumbnail']}" alt="thumbnail">
+                        <div>
+                            <p class="tf-candidate-title">{chosen['title']}</p>
+                            <p class="tf-candidate-channel">{chosen['channel']}</p>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                if st.button("✅ Confirm This Track", use_container_width=True, key="confirm_candidate_btn"):
+                    cleaned = clean_youtube_title(chosen["title"])
+                    guess = split_artist_title_regex(cleaned)
+                    confirmed_artist = guess.artist or typed_artist
+                    confirmed_title = guess.title or typed_title or cleaned
+                    st.session_state.confirmed_seed = {
+                        "artist": confirmed_artist,
+                        "title": confirmed_title,
+                        "video_id": chosen["video_id"],
+                    }
+                    # Instant playback the moment a track is confirmed.
+                    st.session_state.now_playing = {
+                        "Song": confirmed_title,
+                        "Artist": confirmed_artist,
+                        "video_id": chosen["video_id"],
+                    }
+                    st.toast(f"Confirmed: {confirmed_title} — {confirmed_artist} ✅", icon="🎯")
+                    st.rerun()
+
+            elif search_performed and not yt_key:
+                # Smart fallback when no YOUTUBE_API_KEY is configured: a
+                # clean manual confirmation step instead of real candidates.
+                st.info(
+                    "No `YOUTUBE_API_KEY` configured, so TrackFind can't pull real search "
+                    "matches. Confirm the details below to proceed anyway:"
+                )
+                fb_artist = st.text_input("Confirm Artist", value=typed_artist, key="fallback_artist")
+                fb_title = st.text_input("Confirm Track Title", value=typed_title, key="fallback_title")
+                if st.button("✅ Confirm This Track", use_container_width=True, key="confirm_fallback_btn"):
+                    st.session_state.confirmed_seed = {
+                        "artist": fb_artist,
+                        "title": fb_title,
+                        "video_id": "",
+                    }
+                    st.session_state.now_playing = {
+                        "Song": fb_title,
+                        "Artist": fb_artist,
+                        "video_id": "",
+                    }
+                    st.session_state.search_performed = False
+                    st.toast(f"Confirmed: {fb_title} — {fb_artist} ✅", icon="🎯")
+                    st.rerun()
+
+            elif search_performed and yt_key and not st.session_state.search_candidates:
+                st.warning("No matches found on YouTube for that search. Try simplifying the query, or confirm manually below.")
+                fb_artist = st.text_input("Confirm Artist", value=typed_artist, key="fallback_artist_noresults")
+                fb_title = st.text_input("Confirm Track Title", value=typed_title, key="fallback_title_noresults")
+                if st.button("✅ Confirm This Track", use_container_width=True, key="confirm_fallback_noresults_btn"):
+                    st.session_state.confirmed_seed = {
+                        "artist": fb_artist,
+                        "title": fb_title,
+                        "video_id": "",
+                    }
+                    st.session_state.now_playing = {
+                        "Song": fb_title,
+                        "Artist": fb_artist,
+                        "video_id": "",
+                    }
+                    st.session_state.search_performed = False
+                    st.toast(f"Confirmed: {fb_title} — {fb_artist} ✅", icon="🎯")
+                    st.rerun()
+
+            # ---- Show current confirmation status ----
+            if st.session_state.confirmed_seed:
+                cs = st.session_state.confirmed_seed
+                st.success(f"🎯 Locked in: **{cs['title']}** — *{cs['artist']}*")
+                seed_artist, seed_title = cs["artist"], cs["title"]
+                seed_video_id = cs.get("video_id", "")
+            else:
+                # Allow generating straight from typed fields too (search is
+                # a recommended verification step, not a hard gate), but
+                # nudge the user toward it.
+                seed_artist, seed_title = typed_artist, typed_title
+                if (typed_artist or typed_title) and not search_performed:
+                    st.caption("💡 Tip: click **🔍 Search Track** to verify the exact match before generating recommendations.")
+
+        # ===================================================================
+        # MODE B: 🔗 YouTube Link  ([BUG FIX] Instant playback + tiered parsing)
+        # ===================================================================
         else:
             yt_url = st.text_input(
                 "YouTube Link",
                 placeholder="https://www.youtube.com/watch?v=...",
+                key="yt_url_input",
             )
+
             if yt_url:
-                with st.spinner("Parsing YouTube link..."):
-                    seed = parse_youtube_link(yt_url)
+                # Only re-parse when the URL actually changes, to avoid
+                # re-fetching/re-parsing on every unrelated widget rerun.
+                if st.session_state.get("_last_parsed_url") != yt_url:
+                    with st.spinner("Parsing YouTube link..."):
+                        seed = parse_youtube_link(yt_url)
+                    st.session_state["_last_parsed_seed"] = asdict(seed)
+                    st.session_state["_last_parsed_url"] = yt_url
 
-                seed_video_id = seed.video_id
+                    # [BUG FIX 2] Update the player THE MOMENT we have a
+                    # video_id — independent of clicking Generate.
+                    if seed.video_id:
+                        st.session_state.now_playing = {
+                            "Song": seed.title,
+                            "Artist": seed.artist,
+                            "video_id": seed.video_id,
+                        }
 
-                if seed.title:
-                    seed_artist, seed_title = seed.artist, seed.title
-                    st.success(f"✅ Detected: **{seed_title}**" + (f" — *{seed_artist}*" if seed_artist else ""))
-                    if not seed_artist:
+                parsed = st.session_state.get("_last_parsed_seed", {})
+                seed_video_id = parsed.get("video_id", "")
+                parse_confidence = parsed.get("parse_confidence", "high")
+
+                if parsed.get("title"):
+                    seed_artist_default = parsed.get("artist", "")
+                    seed_title_default = parsed.get("title", "")
+
+                    confidence_badge = (
+                        '<span class="tf-confidence-pill tf-confidence-refined">✨ Gemini-refined</span>'
+                        if parse_confidence == "refined"
+                        else '<span class="tf-confidence-pill tf-confidence-high">Auto-detected</span>'
+                    )
+                    st.markdown(
+                        f"✅ Detected: **{seed_title_default}** — *{seed_artist_default or 'Unknown artist'}* {confidence_badge}",
+                        unsafe_allow_html=True,
+                    )
+                    if not seed_artist_default:
                         st.caption("Couldn't separate the artist automatically — feel free to refine below.")
-                    seed_artist = st.text_input("Confirm / edit Artist", value=seed_artist, key="yt_artist_confirm")
-                    seed_title = st.text_input("Confirm / edit Track Title", value=seed_title, key="yt_title_confirm")
+
+                    seed_artist = st.text_input("Confirm / edit Artist", value=seed_artist_default, key="yt_artist_confirm")
+                    seed_title = st.text_input("Confirm / edit Track Title", value=seed_title_default, key="yt_title_confirm")
+
+                    # If the user hand-edits the fields, keep the player in
+                    # sync with whatever is currently shown.
+                    if st.session_state.now_playing and st.session_state.now_playing.get("video_id") == seed_video_id:
+                        st.session_state.now_playing["Song"] = seed_title
+                        st.session_state.now_playing["Artist"] = seed_artist
+
                 elif seed_video_id:
                     st.warning("⚠️ Found the video but couldn't auto-extract a clean title. Please enter details manually — the original video link will still be used for preview.")
                     seed_artist = st.text_input("Artist Name (manual)", key="yt_artist_manual")
@@ -953,8 +1385,9 @@ with tab_discover:
 
             # If we don't already have a confirmed video (e.g. this came from
             # an AI recommendation or manual typing rather than a pasted
-            # link), try to auto-resolve a real one via the YouTube Data API
-            # — but only if the user has configured that optional key.
+            # link or confirmed search result), try to auto-resolve a real
+            # one via the YouTube Data API — but only if that optional key
+            # is configured.
             if not video_id:
                 yt_key = get_youtube_api_key()
                 if yt_key:
