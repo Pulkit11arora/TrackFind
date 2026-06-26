@@ -7,6 +7,45 @@ Google Gen AI SDK (Gemini).
 Run locally:
     pip install -r requirements.txt
     streamlit run app.py
+
+Deploy on Streamlit Community Cloud:
+    1. Push this repo (app.py + requirements.txt) to GitHub.
+    2. On https://share.streamlit.io, create a new app pointing at app.py.
+    3. In the app's "Secrets" settings, add:
+           GEMINI_API_KEY = "your-real-key-here"
+
+           # Optional — enables (a) automatic inline playback for every AI
+           # recommendation, and (b) the "🔍 Search Track" verification step
+           # under Artist + Track mode. Free tier: ~100 searches/day.
+           # Get one at https://console.cloud.google.com/
+           # (enable "YouTube Data API v3", then create an API key).
+           YOUTUBE_API_KEY = "your-youtube-key-here"
+
+QA / PM CHANGELOG (this revision):
+    [FEATURE] Artist + Track mode now has an explicit "🔍 Search Track"
+              confirmation step — matches are shown as selectable cards
+              before any recommendation is generated.
+    [BUG FIX] Pasting a YouTube link now updates the "Now Sampling" player
+              immediately on parse, instead of waiting for the user to click
+              "Generate Recommendations".
+    [BUG FIX] YouTube title parsing is now tiered: a fast regex pass handles
+              simple "Artist - Title" uploads; complex multi-segment titles
+              (multiple pipes/dashes, e.g. corporate Bollywood/Punjabi
+              uploads) are flagged low-confidence and refined with a tiny
+              Gemini call so Artist/Title no longer get scrambled.
+    [BUG FIX] refine_title_with_gemini's prompt now explicitly teaches the
+              model to (a) honor explicit "Song:"/"Movie:"/"Singer:"/"Track:"
+              labels when present, and (b) apply clear structural/positional
+              rules (title is usually the last segment, esp. after a dash;
+              a short standalone proper-noun middle segment is the movie/
+              album, never the title) — fixes cases where the movie name and
+              song title were getting inverted on complex regional uploads.
+    [UX FIX]  "🔍 Search Track" now appends music-context keywords to the
+              query behind the scenes (e.g. "official audio music song")
+              when the user provides a sparse query (single keyword or
+              artist-only), so YouTube search no longer surfaces unrelated
+              talk-show clips, shorts, or OTT promo content instead of
+              actual songs.
 """
 
 import os
@@ -15,13 +54,13 @@ import csv
 import io
 import json
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# Google Gen AI SDK & Validation Models
+# Google Gen AI SDK
 # ---------------------------------------------------------------------------
 from google import genai
 from google.genai import types
@@ -29,12 +68,20 @@ from pydantic import BaseModel, Field
 
 
 # ===========================================================================
-# 1. CORE LAYOUT VARIABLES & CONSTANTS
+# 1. CONFIGURATION & CONSTANTS
 # ===========================================================================
 
 APP_TITLE = "🎵 TrackFind — Your Personal AI Music Curator"
+
+# Google retires Gemini model IDs on a rolling basis — gemini-1.5-flash and
+# gemini-2.0-flash have both already been shut down (404 NOT_FOUND on any
+# request). gemini-2.5-flash is the current widely-available default as of
+# June 2026. If you hit a 404 again in the future, just change this one
+# string — everything else in the app is model-agnostic.
 GEMINI_MODEL = "gemini-2.5-flash"
 
+# If GEMINI_MODEL above 404s for your key/account, TrackFind will automatically
+# retry against each of these, in order, before giving up.
 GEMINI_MODEL_FALLBACKS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
@@ -42,46 +89,107 @@ GEMINI_MODEL_FALLBACKS = [
     "gemini-flash-latest",
 ]
 
+# ---------------------------------------------------------------------------
+# 🔑 GEMINI API KEY — CONFIGURATION PLACEHOLDER
+# ---------------------------------------------------------------------------
+# TrackFind looks for your key in this priority order:
+#   1. Streamlit secrets   -> .streamlit/secrets.toml  ->  GEMINI_API_KEY = "..."
+#   2. Environment variable -> export GEMINI_API_KEY="..."
+#   3. The placeholder string below (NOT recommended for production)
+#
+# >>> REPLACE THE LINE BELOW WITH YOUR OWN KEY, OR BETTER YET, USE SECRETS <<<
 GEMINI_API_KEY_PLACEHOLDER = "YOUR_GEMINI_API_KEY_HERE"
+
+
+def get_api_key() -> Optional[str]:
+    """Resolve the Gemini API key from secrets, env vars, or placeholder."""
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        pass
+
+    env_key = os.environ.get("GEMINI_API_KEY")
+    if env_key:
+        return env_key
+
+    if GEMINI_API_KEY_PLACEHOLDER and GEMINI_API_KEY_PLACEHOLDER != "YOUR_GEMINI_API_KEY_HERE":
+        return GEMINI_API_KEY_PLACEHOLDER
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 🔑 YOUTUBE DATA API KEY — OPTIONAL CONFIGURATION PLACEHOLDER
+# ---------------------------------------------------------------------------
+# This key is OPTIONAL but unlocks two features:
+#   (a) The "🔍 Search Track" verification step in Artist + Track mode.
+#   (b) Automatic inline playback for AI-recommended tracks (not just pasted
+#       links), since Gemini only ever returns song names, never URLs.
+#
+# Without it, both features degrade gracefully: search becomes a manual
+# confirmation step instead of real candidates, and playback falls back to
+# a "Find & play on YouTube" link button.
+#
+# Get a free key in ~2 minutes:
+#   1. https://console.cloud.google.com/ -> create/select a project
+#   2. APIs & Services -> Library -> enable "YouTube Data API v3"
+#   3. APIs & Services -> Credentials -> Create Credentials -> API key
+#
+# Free quota: 10,000 units/day; each search costs 100 units (~100 searches/day).
+#
+# Same priority order as the Gemini key:
+#   1. Streamlit secrets   -> YOUTUBE_API_KEY = "..."
+#   2. Environment variable -> export YOUTUBE_API_KEY="..."
+#   3. The placeholder string below (NOT recommended for production)
+#
+# >>> REPLACE THE LINE BELOW WITH YOUR OWN KEY, OR BETTER YET, USE SECRETS <<<
 YOUTUBE_API_KEY_PLACEHOLDER = "YOUR_YOUTUBE_API_KEY_HERE"
 
-YOUTUBE_ID_PATTERNS = [
-    r"(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([A-Za-z0-9_-]{11})",
-]
 
-FLUFF_PATTERNS = [
-    r"\(\s*official\s*video\s*\)", r"\[\s*official\s*video\s*\]",
-    r"\(\s*official\s*audio\s*\)", r"\[\s*official\s*audio\s*\]",
-    r"\(\s*official\s*music\s*video\s*\)", r"\[\s*official\s*music\s*video\s*\]",
-    r"\(\s*official\s*lyric\s*video\s*\)", r"\[\s*official\s*lyric\s*video\s*\]",
-    r"\(\s*lyrics?\s*\)", r"\[\s*lyrics?\s*\]",
-    r"\(\s*lyric\s*video\s*\)", r"\[\s*lyric\s*video\s*\]",
-    r"\(\s*audio\s*\)", r"\[\s*audio\s*\]",
-    r"\(\s*visualizer\s*\)", r"\[\s*visualizer\s*\]",
-    r"\(\s*hd\s*\)", r"\[\s*hd\s*\]", r"\(\s*4k\s*\)", r"\[\s*4k\s*\]", r"\(\s*hq\s*\)", r"\[\s*hq\s*\]",
-    r"\(\s*full\s*video\s*\)", r"\[\s*full\s*video\s*\]",
-    r"\(\s*full\s*song\s*\)", r"\[\s*full\s*song\s*\]",
-    r"\bofficial\s*video\b", r"\bofficial\s*audio\b",
-    r"\bofficial\s*music\s*video\b", r"\bofficial\s*lyric\s*video\b",
-    r"\bmusic\s*video\b", r"\blyric\s*video\b", r"\blyrics\b",
-    r"\bvisualizer\b", r"\b4k\b", r"\bhd\b", r"\bhq\b", r"\bfull\s*video\b",
-    r"\bremastered\b", r"\bclean\s*version\b", r"\bexplicit\s*version\b",
-    r"\(\s*explicit\s*\)", r"\[\s*explicit\s*\]",
-]
+def get_youtube_api_key() -> Optional[str]:
+    """Resolve the optional YouTube Data API key from secrets, env, or placeholder."""
+    try:
+        if "YOUTUBE_API_KEY" in st.secrets:
+            return st.secrets["YOUTUBE_API_KEY"]
+    except Exception:
+        pass
 
-FLUFF_REGEX = re.compile("|".join(FLUFF_PATTERNS), flags=re.IGNORECASE)
+    env_key = os.environ.get("YOUTUBE_API_KEY")
+    if env_key:
+        return env_key
 
-NOISE_SEGMENT_PATTERNS = [
-    r"^(latest|new|hit|top|best)?\s*(punjabi|hindi|bollywood|english|haryanvi)?\s*song(s)?\s*\d*$",
-    r"^official\s*(video|audio)?$",
-]
-NOISE_SEGMENT_REGEX = re.compile("|".join(NOISE_SEGMENT_PATTERNS), flags=re.IGNORECASE)
+    if YOUTUBE_API_KEY_PLACEHOLDER and YOUTUBE_API_KEY_PLACEHOLDER != "YOUR_YOUTUBE_API_KEY_HERE":
+        return YOUTUBE_API_KEY_PLACEHOLDER
+
+    return None
+
+
+# ===========================================================================
+# 2. PAGE CONFIG
+# ===========================================================================
+
+st.set_page_config(
+    page_title="TrackFind | AI Music Curator",
+    page_icon="🎵",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+
+# ===========================================================================
+# 3. CUSTOM CSS — DARK / NEON-EMERALD MUSIC THEME
+# ===========================================================================
 
 CUSTOM_CSS = """
 <style>
+    /* ---------- Global ---------- */
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap');
 
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header[data-testid="stHeader"] {background: transparent;}
@@ -90,6 +198,8 @@ CUSTOM_CSS = """
         background: radial-gradient(circle at 10% 0%, #132022 0%, #0b0f10 45%, #08090a 100%);
         color: #E6F1EE;
     }
+
+    /* ---------- Hero Header ---------- */
     .tf-hero {
         padding: 2.1rem 2.4rem;
         border-radius: 22px;
@@ -99,6 +209,14 @@ CUSTOM_CSS = """
         margin-bottom: 1.6rem;
         position: relative;
         overflow: hidden;
+    }
+    .tf-hero::after {
+        content: "";
+        position: absolute;
+        top: -60px; right: -60px;
+        width: 220px; height: 220px;
+        background: radial-gradient(circle, rgba(16,185,129,0.35), transparent 70%);
+        filter: blur(10px);
     }
     .tf-hero h1 {
         font-family: 'Space Grotesk', sans-serif;
@@ -110,23 +228,36 @@ CUSTOM_CSS = """
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
     }
-    .tf-hero p { margin: 0.45rem 0 0 0; color: #9CB8B0; font-size: 0.98rem; }
+    .tf-hero p {
+        margin: 0.45rem 0 0 0;
+        color: #9CB8B0;
+        font-size: 0.98rem;
+        font-weight: 400;
+    }
+
+    /* ---------- Section / Card Containers ---------- */
     .tf-card {
         background: linear-gradient(155deg, rgba(255,255,255,0.035) 0%, rgba(255,255,255,0.012) 100%);
         border: 1px solid rgba(255,255,255,0.07);
         border-radius: 18px;
         padding: 1.4rem 1.5rem;
         margin-bottom: 1.1rem;
+        box-shadow: 0 4px 18px rgba(0,0,0,0.25);
     }
     .tf-card-title {
         font-family: 'Space Grotesk', sans-serif;
         font-weight: 600;
         color: #6EE7B7;
         margin-bottom: 0.65rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
         text-transform: uppercase;
         letter-spacing: 0.04em;
         font-size: 0.82rem;
     }
+
+    /* ---------- Track Row Card ---------- */
     .tf-track {
         background: rgba(255,255,255,0.03);
         border: 1px solid rgba(255,255,255,0.06);
@@ -134,10 +265,32 @@ CUSTOM_CSS = """
         border-radius: 14px;
         padding: 0.95rem 1.15rem;
         margin-bottom: 0.65rem;
+        transition: all 0.15s ease;
     }
-    .tf-track-song { font-weight: 700; font-size: 1.02rem; color: #F0FDF9; margin: 0; }
-    .tf-track-artist { color: #6EE7B7; font-weight: 500; font-size: 0.86rem; margin: 0.1rem 0 0.4rem 0; }
-    .tf-track-reason { color: #9CB8B0; font-size: 0.84rem; font-style: italic; margin: 0; }
+    .tf-track:hover {
+        background: rgba(16,185,129,0.07);
+        border-left-color: #34D399;
+        transform: translateX(2px);
+    }
+    .tf-track-song {
+        font-weight: 700;
+        font-size: 1.02rem;
+        color: #F0FDF9;
+        margin: 0;
+    }
+    .tf-track-artist {
+        color: #6EE7B7;
+        font-weight: 500;
+        font-size: 0.86rem;
+        margin: 0.1rem 0 0.4rem 0;
+    }
+    .tf-track-reason {
+        color: #9CB8B0;
+        font-size: 0.84rem;
+        font-style: italic;
+        line-height: 1.35;
+        margin: 0;
+    }
     .tf-badge {
         display: inline-block;
         background: rgba(16,185,129,0.15);
@@ -145,10 +298,28 @@ CUSTOM_CSS = """
         border: 1px solid rgba(16,185,129,0.35);
         font-size: 0.68rem;
         font-weight: 700;
+        letter-spacing: 0.04em;
         padding: 0.15rem 0.55rem;
         border-radius: 999px;
         margin-bottom: 0.4rem;
+        text-transform: uppercase;
     }
+
+    /* ---------- Vault track row ---------- */
+    .tf-vault-row {
+        background: rgba(255,255,255,0.025);
+        border: 1px solid rgba(255,255,255,0.06);
+        border-radius: 12px;
+        padding: 0.7rem 1rem;
+        margin-bottom: 0.5rem;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    .tf-vault-row span.tf-vault-title { font-weight: 600; color: #F0FDF9; }
+    .tf-vault-row span.tf-vault-artist { color: #6EE7B7; font-size: 0.85rem; }
+
+    /* ---------- Search-result candidate card (Feature 1) ---------- */
     .tf-candidate {
         background: rgba(255,255,255,0.03);
         border: 1px solid rgba(255,255,255,0.07);
@@ -158,58 +329,211 @@ CUSTOM_CSS = """
         display: flex;
         align-items: center;
         gap: 0.7rem;
+        transition: all 0.15s ease;
     }
-    .tf-candidate img { border-radius: 8px; width: 64px; height: 48px; object-fit: cover; }
-    .tf-candidate-title { font-weight: 600; font-size: 0.88rem; color: #F0FDF9; margin: 0; }
-    .tf-candidate-channel { font-size: 0.74rem; color: #7E978F; margin: 0; }
+    .tf-candidate:hover {
+        border-color: rgba(16,185,129,0.4);
+        background: rgba(16,185,129,0.06);
+    }
+    .tf-candidate img {
+        border-radius: 8px;
+        width: 64px;
+        height: 48px;
+        object-fit: cover;
+        flex-shrink: 0;
+    }
+    .tf-candidate-title {
+        font-weight: 600;
+        font-size: 0.88rem;
+        color: #F0FDF9;
+        line-height: 1.25;
+        margin: 0;
+    }
+    .tf-candidate-channel {
+        font-size: 0.74rem;
+        color: #7E978F;
+        margin: 0.1rem 0 0 0;
+    }
     .tf-confidence-pill {
         display: inline-block;
         font-size: 0.66rem;
         font-weight: 700;
+        letter-spacing: 0.03em;
         padding: 0.1rem 0.5rem;
         border-radius: 999px;
         text-transform: uppercase;
         margin-left: 0.4rem;
     }
-    .tf-confidence-high { background: rgba(16,185,129,0.15); color: #6EE7B7; border: 1px solid rgba(16,185,129,0.35); }
-    .tf-confidence-refined { background: rgba(167,139,250,0.15); color: #C4B5FD; border: 1px solid rgba(167,139,250,0.35); }
-    
+    .tf-confidence-high {
+        background: rgba(16,185,129,0.15);
+        color: #6EE7B7;
+        border: 1px solid rgba(16,185,129,0.35);
+    }
+    .tf-confidence-refined {
+        background: rgba(167,139,250,0.15);
+        color: #C4B5FD;
+        border: 1px solid rgba(167,139,250,0.35);
+    }
+
+    /* ---------- Buttons ---------- */
     .stButton > button {
         border-radius: 10px !important;
         border: 1px solid rgba(16,185,129,0.4) !important;
         background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(16,185,129,0.06)) !important;
         color: #6EE7B7 !important;
         font-weight: 600 !important;
+        padding: 0.45rem 1rem !important;
+        transition: all 0.15s ease !important;
+        box-shadow: none !important;
     }
     .stButton > button:hover {
         background: linear-gradient(135deg, #10B981, #059669) !important;
         color: #06120D !important;
+        border-color: #34D399 !important;
+        box-shadow: 0 0 18px rgba(16,185,129,0.35) !important;
     }
+    .stButton > button:active { transform: scale(0.98); }
+
+    div[data-testid="stFormSubmitButton"] button {
+        background: linear-gradient(135deg, #10B981, #047857) !important;
+        color: #06120D !important;
+        border: none !important;
+        font-weight: 700 !important;
+        width: 100%;
+    }
+
+    /* Primary CTA (Generate Recommendations) */
     .tf-primary-btn .stButton > button {
         background: linear-gradient(135deg, #10B981, #059669) !important;
         color: #06120D !important;
         font-weight: 700 !important;
+        font-size: 1rem !important;
+        padding: 0.7rem 1.2rem !important;
+        width: 100%;
+        border: none !important;
+        box-shadow: 0 0 24px rgba(16,185,129,0.3) !important;
     }
+
+    /* Secondary CTA (Search Track) */
     .tf-search-btn .stButton > button {
-        background: rgba(110,231,183,0.1) !important;
+        background: linear-gradient(135deg, rgba(110,231,183,0.16), rgba(16,185,129,0.05)) !important;
         color: #6EE7B7 !important;
+        font-weight: 700 !important;
+        width: 100%;
         border: 1px dashed rgba(110,231,183,0.45) !important;
     }
-    .stTextInput input, .stTextArea textarea { background: rgba(255,255,255,0.04) !important; border: 1px solid rgba(255,255,255,0.1) !important; color: #F0FDF9 !important; }
-    .tf-stat-chip { display: inline-block; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); border-radius: 10px; padding: 0.5rem 1rem; color: #6EE7B7; font-weight: 700; }
-    .tf-stat-chip span { display: block; font-size: 0.68rem; color: #9CB8B0; }
+    .tf-search-btn .stButton > button:hover {
+        border-style: solid !important;
+    }
+
+    /* ---------- Inputs ---------- */
+    .stTextInput input, .stTextArea textarea {
+        background: rgba(255,255,255,0.04) !important;
+        border: 1px solid rgba(255,255,255,0.1) !important;
+        border-radius: 10px !important;
+        color: #F0FDF9 !important;
+    }
+    .stTextInput input:focus, .stTextArea textarea:focus {
+        border-color: #10B981 !important;
+        box-shadow: 0 0 0 1px rgba(16,185,129,0.4) !important;
+    }
+
+    /* ---------- Slider ---------- */
+    div[data-testid="stSlider"] [role="slider"] {
+        background-color: #10B981 !important;
+        box-shadow: 0 0 10px rgba(16,185,129,0.6) !important;
+    }
+    div[data-testid="stSlider"] > div > div > div > div {
+        background: linear-gradient(90deg, #047857, #10B981) !important;
+    }
+
+    /* ---------- Tabs ---------- */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 6px;
+        background: rgba(255,255,255,0.02);
+        padding: 6px;
+        border-radius: 14px;
+        border: 1px solid rgba(255,255,255,0.06);
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 44px;
+        border-radius: 10px;
+        color: #9CB8B0;
+        font-weight: 600;
+        font-size: 0.92rem;
+    }
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, rgba(16,185,129,0.22), rgba(16,185,129,0.08)) !important;
+        color: #6EE7B7 !important;
+        border: 1px solid rgba(16,185,129,0.3);
+    }
+
+    /* ---------- Radio / Segmented ---------- */
+    div[role="radiogroup"] label {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 10px;
+        padding: 0.4rem 0.9rem;
+        margin-right: 0.4rem;
+    }
+
+    /* ---------- Misc text ---------- */
+    .tf-subtle { color: #7E978F; font-size: 0.82rem; }
+    .tf-divider {
+        border: none;
+        border-top: 1px solid rgba(255,255,255,0.08);
+        margin: 1.1rem 0;
+    }
+    .tf-empty-state {
+        text-align: center;
+        padding: 2.4rem 1rem;
+        color: #6B8580;
+    }
+    .tf-empty-state .tf-emoji { font-size: 2.4rem; display: block; margin-bottom: 0.6rem; }
+
+    /* Metric-like stat chip */
+    .tf-stat-chip {
+        display: inline-block;
+        background: rgba(16,185,129,0.1);
+        border: 1px solid rgba(16,185,129,0.3);
+        border-radius: 10px;
+        padding: 0.5rem 1rem;
+        color: #6EE7B7;
+        font-weight: 700;
+        font-size: 1.1rem;
+        margin-right: 0.6rem;
+    }
+    .tf-stat-chip span { display: block; font-size: 0.68rem; color: #9CB8B0; font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; }
+
+    /* Download button styling override */
+    div[data-testid="stDownloadButton"] button {
+        background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(16,185,129,0.06)) !important;
+        color: #6EE7B7 !important;
+        border: 1px solid rgba(16,185,129,0.4) !important;
+        font-weight: 600 !important;
+        width: 100%;
+    }
+    div[data-testid="stDownloadButton"] button:hover {
+        background: linear-gradient(135deg, #10B981, #059669) !important;
+        color: #06120D !important;
+    }
 </style>
 """
 
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
 
 # ===========================================================================
-# 2. DATA MODELS
+# 4. DATA MODELS
 # ===========================================================================
 
 class RecommendedTrack(BaseModel):
+    """Strict schema Gemini must follow for every recommendation."""
     Song: str = Field(description="The title of the recommended track.")
     Artist: str = Field(description="The artist name.")
-    Reason: str = Field(description="A short, clear explanation of WHY this song was chosen.")
+    Reason: str = Field(
+        description="A short, clear explanation of WHY this song was chosen."
+    )
 
 
 class RecommendationList(BaseModel):
@@ -217,6 +541,7 @@ class RecommendationList(BaseModel):
 
 
 class ParsedTitle(BaseModel):
+    """Strict schema for the Gemini micro-parse fallback (Bug Fix #3 / #5)."""
     artist: str = Field(description="The primary recording singer/artist's name only — a person or group, never a movie/film/album name, no featured artists, no promotional text.")
     title: str = Field(description="The actual standalone song title only — never a movie/film/album name, never a language or genre tag, no promotional text.")
 
@@ -225,68 +550,103 @@ class ParsedTitle(BaseModel):
 class SeedTrack:
     artist: str = ""
     title: str = ""
-    raw_source: str = ""   
-    video_id: str = ""     
-    parse_confidence: str = "high" 
+    raw_source: str = ""   # original pasted YouTube URL, for display/debug
+    video_id: str = ""     # real YouTube video ID, set only when known
+    parse_confidence: str = "high"  # "high" (simple regex) or "refined" (Gemini-assisted)
 
 
 # ===========================================================================
-# 3. INTERFACE FORMATTING & SETUP PIPELINES
+# 5. SESSION STATE INITIALIZATION
 # ===========================================================================
 
-def get_api_key() -> Optional[str]:
-    try:
-        if "GEMINI_API_KEY" in st.secrets:
-            return st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        pass
-    env_key = os.environ.get("GEMINI_API_KEY")
-    if env_key:
-        return env_key
-    if GEMINI_API_KEY_PLACEHOLDER and GEMINI_API_KEY_PLACEHOLDER != "YOUR_GEMINI_API_KEY_HERE":
-        return GEMINI_API_KEY_PLACEHOLDER
-    return None
+def init_session_state():
+    defaults = {
+        "recommendations": [],          # list of dicts: Song, Artist, Reason
+        "playlist_vault": [],           # list of dicts: Song, Artist, Reason
+        "now_playing": None,            # dict: {"Song":..., "Artist":..., "video_id":...}
+        "last_seed": None,              # SeedTrack as dict
+        "has_generated": False,
+        "working_model": None,          # whichever Gemini model actually succeeded
+        "search_candidates": [],        # list of dicts from YouTube search, for Feature 1
+        "confirmed_seed": None,         # dict: {"artist":..., "title":..., "video_id":...} once user confirms a candidate
+        "last_search_query": "",        # actual augmented query sent to YouTube search
+        "last_search_display_query": "",  # clean user-facing version (no injected keywords)
+        "search_performed": False,      # persists across reruns (fixes a transient-button-state bug)
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 
 
-def get_youtube_api_key() -> Optional[str]:
-    try:
-        if "YOUTUBE_API_KEY" in st.secrets:
-            return st.secrets["YOUTUBE_API_KEY"]
-    except Exception:
-        pass
-    env_key = os.environ.get("YOUTUBE_API_KEY")
-    if env_key:
-        return env_key
-    if YOUTUBE_API_KEY_PLACEHOLDER and YOUTUBE_API_KEY_PLACEHOLDER != "YOUR_YOUTUBE_API_KEY_HERE":
-        return YOUTUBE_API_KEY_PLACEHOLDER
-    return None
-
-
-def get_genai_client() -> Optional[genai.Client]:
-    api_key = get_api_key()
-    if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
-        return None
-    try:
-        return genai.Client(api_key=api_key)
-    except Exception:
-        return None
-
-
-def render_hero():
-    st.markdown(
-        f"""
-        <div class="tf-hero">
-            <h1>{APP_TITLE}</h1>
-            <p>Discover your next favorite track — powered by Gemini AI, styled for the way you actually listen.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+init_session_state()
 
 
 # ===========================================================================
-# 4. PARSING, METADATA ISOLATION, & CONTEXTUAL FILTERING
+# 6. YOUTUBE LINK PARSING / CLEANING LOGIC
 # ===========================================================================
+
+YOUTUBE_ID_PATTERNS = [
+    r"(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([A-Za-z0-9_-]{11})",
+]
+
+# Fluff tokens commonly found in YouTube music video titles
+FLUFF_PATTERNS = [
+    r"\(\s*official\s*video\s*\)",
+    r"\[\s*official\s*video\s*\]",
+    r"\(\s*official\s*audio\s*\)",
+    r"\[\s*official\s*audio\s*\]",
+    r"\(\s*official\s*music\s*video\s*\)",
+    r"\[\s*official\s*music\s*video\s*\]",
+    r"\(\s*official\s*lyric\s*video\s*\)",
+    r"\[\s*official\s*lyric\s*video\s*\]",
+    r"\(\s*lyrics?\s*\)",
+    r"\[\s*lyrics?\s*\]",
+    r"\(\s*lyric\s*video\s*\)",
+    r"\[\s*lyric\s*video\s*\]",
+    r"\(\s*audio\s*\)",
+    r"\[\s*audio\s*\]",
+    r"\(\s*visualizer\s*\)",
+    r"\[\s*visualizer\s*\]",
+    r"\(\s*hd\s*\)",
+    r"\[\s*hd\s*\]",
+    r"\(\s*4k\s*\)",
+    r"\[\s*4k\s*\]",
+    r"\(\s*hq\s*\)",
+    r"\[\s*hq\s*\]",
+    r"\(\s*full\s*video\s*\)",
+    r"\[\s*full\s*video\s*\]",
+    r"\(\s*full\s*song\s*\)",
+    r"\[\s*full\s*song\s*\]",
+    r"\bofficial\s*video\b",
+    r"\bofficial\s*audio\b",
+    r"\bofficial\s*music\s*video\b",
+    r"\bofficial\s*lyric\s*video\b",
+    r"\bmusic\s*video\b",
+    r"\blyric\s*video\b",
+    r"\blyrics\b",
+    r"\bvisualizer\b",
+    r"\b4k\b",
+    r"\bhd\b",
+    r"\bhq\b",
+    r"\bfull\s*video\b",
+    r"\bremastered\b",
+    r"\bclean\s*version\b",
+    r"\bexplicit\s*version\b",
+    r"\(\s*explicit\s*\)",
+    r"\[\s*explicit\s*\]",
+]
+
+FLUFF_REGEX = re.compile("|".join(FLUFF_PATTERNS), flags=re.IGNORECASE)
+
+# Whole-segment noise — matches an ENTIRE pipe/dash-delimited segment that is
+# pure metadata cruft (not just a substring within a meaningful segment).
+# Used only in the multi-segment (Tier B) parsing path.
+NOISE_SEGMENT_PATTERNS = [
+    r"^(latest|new|hit|top|best)?\s*(punjabi|hindi|bollywood|english|haryanvi)?\s*song(s)?\s*\d*$",
+    r"^official\s*(video|audio)?$",
+]
+NOISE_SEGMENT_REGEX = re.compile("|".join(NOISE_SEGMENT_PATTERNS), flags=re.IGNORECASE)
+
 
 def extract_youtube_id(url: str) -> Optional[str]:
     for pattern in YOUTUBE_ID_PATTERNS:
@@ -297,6 +657,12 @@ def extract_youtube_id(url: str) -> Optional[str]:
 
 
 def fetch_youtube_title(video_id: str) -> Optional[str]:
+    """
+    Fetch the page <title> via YouTube's lightweight oEmbed endpoint.
+    No API key required. Falls back to None on any failure (offline,
+    network restrictions, private video, etc.) so the UI can degrade
+    gracefully to manual input.
+    """
     try:
         import urllib.request
         oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
@@ -307,7 +673,41 @@ def fetch_youtube_title(video_id: str) -> Optional[str]:
         return None
 
 
+def clean_youtube_title(raw_title: str) -> str:
+    """
+    Strip common YouTube fluff like 'Official Video', 'HD', '4K', 'Lyrics',
+    '[Official Audio]' etc., leaving a clean candidate track string. This is
+    intentionally conservative — it removes known noise tokens but does NOT
+    attempt to split Artist/Title (see split_artist_title below for that).
+    """
+    if not raw_title:
+        return ""
+
+    cleaned = FLUFF_REGEX.sub("", raw_title)
+
+    # Remove any now-empty bracket/paren pairs left behind
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"\[\s*\]", "", cleaned)
+
+    # Collapse leftover separator junk (extra dashes, pipes, double spaces)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s*[-|]\s*$", "", cleaned)
+    cleaned = re.sub(r"^\s*[-|]\s*", "", cleaned)
+    cleaned = cleaned.strip(" -|·•").strip()
+
+    return cleaned
+
+
 def _is_structurally_complex(cleaned_title: str) -> bool:
+    """
+    Decides whether a cleaned title is simple enough for pure regex, or
+    complex enough to need the Gemini micro-parse fallback (Bug Fix #3).
+
+    "Complex" = 2 or more pipe characters, OR a mix of pipes AND dashes,
+    OR 3+ total separators of any kind. These are the corporate-upload
+    patterns (e.g. "Artist | Album | Latest Punjabi Song — Title") where a
+    fixed-position regex split reliably grabs the wrong segment.
+    """
     pipe_count = cleaned_title.count("|")
     dash_count = len(re.findall(r"\s[-–—]\s", cleaned_title))
     total_separators = pipe_count + dash_count
@@ -315,10 +715,19 @@ def _is_structurally_complex(cleaned_title: str) -> bool:
 
 
 def split_artist_title_regex(cleaned_title: str) -> SeedTrack:
+    """
+    TIER A — fast, free regex split for simple, unambiguous titles.
+
+    Handles the common "Artist - Title" / "Artist | Title" case directly.
+    For anything structurally complex (see _is_structurally_complex), this
+    still produces a best-effort guess, but flags parse_confidence="low" so
+    the caller knows to attempt a Gemini refinement instead of trusting it.
+    """
     if not cleaned_title:
         return SeedTrack(artist="", title="", parse_confidence="high")
 
     if not _is_structurally_complex(cleaned_title):
+        # Simple case: split on the FIRST separator found.
         for sep_pattern in [r"\s+[-–—]\s+", r"\s*\|\s*"]:
             match = re.search(sep_pattern, cleaned_title)
             if match:
@@ -329,6 +738,8 @@ def split_artist_title_regex(cleaned_title: str) -> SeedTrack:
                     return SeedTrack(artist=artist, title=title, parse_confidence="high")
         return SeedTrack(artist="", title=cleaned_title.strip(), parse_confidence="high")
 
+    # TIER B fallback heuristic (used only if Gemini refinement is
+    # unavailable) — segment-based best guess, explicitly low-confidence.
     segments = re.split(r"\s*\|\s*|\s+[-–—]\s+", cleaned_title)
     segments = [s.strip() for s in segments if s.strip()]
 
@@ -346,7 +757,29 @@ def split_artist_title_regex(cleaned_title: str) -> SeedTrack:
     return SeedTrack(artist=artist_guess, title=title_guess, parse_confidence="low")
 
 
+def split_artist_title(cleaned_title: str) -> SeedTrack:
+    """Backwards-compatible wrapper name used elsewhere in the app."""
+    return split_artist_title_regex(cleaned_title)
+
+
 def refine_title_with_gemini(messy_title: str) -> Optional[ParsedTitle]:
+    """
+    TIER C — micro Gemini call used ONLY when the regex split was flagged
+    low-confidence (structurally complex titles like multi-pipe corporate
+    uploads). This is a tiny, cheap, single-purpose call distinct from the
+    main recommendation engine — it does not consume the recommendation
+    model-fallback chain and fails silently (returns None) so callers always
+    have the regex guess as a safety net.
+
+    [BUG FIX] Earlier revisions used a loosely-worded prompt that could
+    invert the movie/album name and the song title on complex regional
+    (Bollywood/Punjabi-style) uploads — e.g. mistaking a short film name
+    like "Sargi" for the song title and the real title "Fer Ohi Hoyea" for
+    something else. This prompt now (1) prioritizes explicit "Song:"/
+    "Movie:"/"Singer:"/"Track:" labels when present, and (2) gives the model
+    concrete structural/positional heuristics for titles with no explicit
+    labels, plus a self-check step before answering.
+    """
     client = get_genai_client()
     if client is None:
         return None
@@ -375,7 +808,7 @@ STEP 2 — If there are no explicit labels, use structural reasoning instead:
   usually the singer and the remaining names are usually featured artists or
   film actors — prefer the first name as the primary artist.
 - A SHORT middle segment that is just one or two words and reads like a
-  single proper noun (e.g. a short film/movie name like 'Sargi') is almost always the
+  single proper noun (e.g. a short film/movie name) is almost always the
   MOVIE or ALBUM name, NOT the song title — even though its brevity might
   make it look like a plausible title. Movie/album names must never be
   returned as either the artist or the title.
@@ -419,6 +852,11 @@ Return ONLY the primary singer/artist and the actual standalone song title.
 
 
 def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
+    """
+    Full pipeline: extract video ID -> fetch raw title -> clean fluff ->
+    split into artist/title (Tier A regex) -> if flagged low-confidence and
+    a Gemini client is available, refine with a micro-call (Tier C).
+    """
     video_id = extract_youtube_id(url)
     if not video_id:
         return SeedTrack(raw_source=url)
@@ -443,15 +881,30 @@ def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
 
 
 def build_music_search_query(typed_artist: str, typed_title: str) -> str:
-    artist_clean = (typed_artist or "").strip()
-    title_clean = (typed_title or "").strip()
+    """
+    [UX FIX] Constructs the YouTube search query used by the "🔍 Search
+    Track" verification step. A bare single-keyword query (e.g. just
+    "diljit" or just "aha") returns broad, irrelevant results from YouTube's
+    general search — talk-show clips, Shorts, or even OTT platform promos
+    (e.g. the "aha" streaming service) instead of actual songs.
 
-    if artist_clean and title_clean:
-        return f"{artist_clean} {title_clean} song"
-    if artist_clean and not title_clean:
-        return f"{artist_clean} official audio music song"
-    if title_clean and not artist_clean:
-        return f"{title_clean} official audio music song"
+    To keep results strictly music-focused without requiring the user to
+    type anything extra, this appends explicit audio/music modifiers behind
+    the scenes:
+        - Artist only            -> "<artist> official audio music song"
+        - Title only              -> "<title> official audio music song"
+        - Both artist and title   -> "<artist> <title> song"
+        - Neither                 -> "" (caller handles the empty case)
+    """
+    typed_artist = (typed_artist or "").strip()
+    typed_title = (typed_title or "").strip()
+
+    if typed_artist and typed_title:
+        return f"{typed_artist} {typed_title} song"
+    if typed_artist and not typed_title:
+        return f"{typed_artist} official audio music song"
+    if typed_title and not typed_artist:
+        return f"{typed_title} official audio music song"
     return ""
 
 
@@ -461,11 +914,37 @@ def build_youtube_search_url(query: str) -> str:
 
 
 def build_youtube_watch_url(video_id: str) -> str:
+    """A real, embeddable YouTube watch URL — safe to pass to st.video()."""
     return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def search_youtube_video_id(query: str, api_key: str) -> Optional[str]:
+    """
+    Resolves a search query to a single best-match real YouTube video ID
+    using the official YouTube Data API v3 search.list endpoint. Used for
+    auto-resolving playback on AI recommendations (no key = graceful None).
+    """
+    results = search_youtube_tracks(query, api_key, max_results=1)
+    return results[0]["video_id"] if results else None
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def search_youtube_tracks(query: str, api_key: str, max_results: int = 5) -> List[dict]:
+    """
+    [FEATURE 1] Resolves a search query to multiple candidate videos via the
+    official YouTube Data API v3 search.list endpoint, so the user can
+    explicitly confirm which exact track they mean before generating
+    recommendations.
+
+    Returns a list of dicts: {video_id, title, channel, thumbnail}.
+    Returns an empty list on any failure (no key, bad key, quota exceeded,
+    network issue, no results) so the UI can degrade to a manual
+    confirmation step instead of crashing.
+
+    Results are cached for 24h per unique (query, max_results) pair to
+    conserve the free 100-searches/day quota.
+    """
     if not api_key or not query:
         return []
     try:
@@ -500,32 +979,47 @@ def search_youtube_tracks(query: str, api_key: str, max_results: int = 5) -> Lis
         return []
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def search_youtube_video_id(query: str, api_key: str) -> Optional[str]:
-    results = search_youtube_tracks(query, api_key, max_results=1)
-    return results[0]["video_id"] if results else None
+# ===========================================================================
+# 7. GEMINI RECOMMENDATION ENGINE
+# ===========================================================================
+
+def get_genai_client() -> Optional[genai.Client]:
+    api_key = get_api_key()
+    if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
+        return None
+    try:
+        return genai.Client(api_key=api_key)
+    except Exception:
+        return None
 
 
 def build_recommendation_prompt(artist: str, title: str, num_recs: int) -> str:
     return f"""
-You are TrackFind, an expert AI music curator with encyclopedic knowledge of songs, artists, genres, eras, moods, and musical structure.
+You are TrackFind, an expert AI music curator with encyclopedic knowledge of
+songs, artists, genres, eras, moods, and musical structure.
 
 A user has provided this seed track:
     Artist: "{artist or 'Unknown'}"
     Title:  "{title or 'Unknown'}"
 
-Recommend exactly {num_recs} songs that a fan of this track would genuinely enjoy.
+Recommend exactly {num_recs} songs that a fan of this track would genuinely
+enjoy. Use a healthy mix of reasoning angles across the list — sonic/mood
+similarity, shared genre or subgenre, same era, shared collaborators or
+influences, similar tempo/instrumentation, or thematic/lyrical similarity.
 
 Rules:
 - Do NOT include the seed track itself in the results.
 - Do NOT repeat the same song twice.
-- Each "Reason" must be ONE short, specific sentence (under 15 words).
+- Each "Reason" must be ONE short, specific sentence (under 15 words),
+  e.g. "Similar dark-pop mood", "Same dynamic tempo and bassline",
+  "Iconic late-90s era match", "Collaborated with the same artist".
 - Favor real, well-known, verifiable songs and artists.
 - Return ONLY the structured data — no preamble, no extra commentary.
 """.strip()
 
 
 def _call_gemini_model(client: "genai.Client", model_name: str, prompt: str) -> List[dict]:
+    """Single-shot call against one specific model name. Raises on failure."""
     response = client.models.generate_content(
         model=model_name,
         contents=prompt,
@@ -536,6 +1030,9 @@ def _call_gemini_model(client: "genai.Client", model_name: str, prompt: str) -> 
             max_output_tokens=4096,
         ),
     )
+
+    # The SDK exposes .parsed when response_schema is provided; fall back
+    # to manual JSON parsing of .text for resilience across SDK versions.
     parsed = getattr(response, "parsed", None)
     if parsed:
         return [item.model_dump() if hasattr(item, "model_dump") else dict(item) for item in parsed]
@@ -544,16 +1041,32 @@ def _call_gemini_model(client: "genai.Client", model_name: str, prompt: str) -> 
     raw_text = raw_text.strip()
     if raw_text.startswith("```"):
         raw_text = re.sub(r"^```(json)?", "", raw_text).rstrip("`").strip()
-    return json.loads(raw_text)
+    data = json.loads(raw_text)
+    return data
 
 
 def get_recommendations(artist: str, title: str, num_recs: int) -> List[dict]:
+    """
+    Calls Gemini with a forced JSON schema (Pydantic) so the response is
+    guaranteed to match: [{"Song":..., "Artist":..., "Reason":...}, ...]
+
+    Google periodically retires Gemini model IDs (gemini-1.5-flash and
+    gemini-2.0-flash are both already shut down as of mid-2026). To keep
+    TrackFind resilient to the next retirement wave, this tries GEMINI_MODEL
+    first, then walks GEMINI_MODEL_FALLBACKS on a 404/NOT_FOUND, and remembers
+    whichever model actually worked for the rest of the session.
+    """
     client = get_genai_client()
     if client is None:
-        raise RuntimeError("Gemini API key not configured. Add GEMINI_API_KEY to secrets.")
+        raise RuntimeError(
+            "Gemini API key not configured. Add GEMINI_API_KEY to your "
+            "Streamlit secrets or environment variables."
+        )
 
     prompt = build_recommendation_prompt(artist, title, num_recs)
 
+    # Try the last-known-good model first (if any), then the configured
+    # default, then the fallback chain — without duplicating attempts.
     candidates = []
     sticky_model = st.session_state.get("working_model")
     for m in [sticky_model, GEMINI_MODEL, *GEMINI_MODEL_FALLBACKS]:
@@ -569,10 +1082,32 @@ def get_recommendations(artist: str, title: str, num_recs: int) -> List[dict]:
         except Exception as e:
             error_str = str(e)
             last_error = e
+            # Only keep trying the next candidate on a "model not found"
+            # style error. Any other error (bad key, quota, network) should
+            # surface immediately instead of silently retrying 4x.
             if "404" not in error_str and "NOT_FOUND" not in error_str.upper():
                 raise
 
-    raise RuntimeError(f"None of the configured Gemini models are available. Last error: {last_error}")
+    raise RuntimeError(
+        f"None of the configured Gemini models are available for this API key "
+        f"(tried: {', '.join(candidates)}). Last error: {last_error}"
+    )
+
+
+# ===========================================================================
+# 8. HELPER UI FUNCTIONS
+# ===========================================================================
+
+def render_hero():
+    st.markdown(
+        f"""
+        <div class="tf-hero">
+            <h1>{APP_TITLE}</h1>
+            <p>Discover your next favorite track — powered by Gemini AI, styled for the way you actually listen.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def add_to_playlist(track: dict):
@@ -610,22 +1145,27 @@ def playlist_to_markdown() -> str:
 
 
 # ===========================================================================
-# 6. APP RENDERING LAYOUT ENGINE (EXECUTES LAST CHRONOLOGICALLY)
+# 9. RENDER: HERO HEADER
 # ===========================================================================
 
-# Inject customized visual theme container definitions
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-
-# Initialize Session State
-init_session_state()
-
-# Render main app header dashboard elements
 render_hero()
+
+
+# ===========================================================================
+# 10. TABS
+# ===========================================================================
+
 tab_discover, tab_vault = st.tabs(["🔎  Discover & Sync", "🎧  My Playlist Vault"])
 
+
+# ---------------------------------------------------------------------------
+# TAB 1: DISCOVER & SYNC
+# ---------------------------------------------------------------------------
 with tab_discover:
+
     col_input, col_player = st.columns([1.35, 1], gap="large")
 
+    # -------------------- LEFT COLUMN: INPUT & CONTROLS --------------------
     with col_input:
         st.markdown('<div class="tf-card">', unsafe_allow_html=True)
         st.markdown('<div class="tf-card-title">🎯 Seed Track Input</div>', unsafe_allow_html=True)
@@ -638,18 +1178,26 @@ with tab_discover:
             key="input_mode_radio",
         )
 
+        # Reset the confirmed seed if the user switches input modes, so a
+        # confirmation from one mode doesn't leak into the other.
         if st.session_state.get("_last_input_mode") != input_mode:
             st.session_state.confirmed_seed = None
             st.session_state.search_candidates = []
             st.session_state.search_performed = False
             st.session_state["_last_input_mode"] = input_mode
 
-        seed_artist, seed_title, seed_video_id = "", "", ""
+        seed_artist, seed_title = "", ""
+        seed_video_id = ""
 
+        # ===================================================================
+        # MODE A: 🎤 Artist + Track  ([FEATURE] Search & Verify)
+        # ===================================================================
         if input_mode == "🎤 Artist + Track":
             c1, c2 = st.columns(2)
-            with c1: typed_artist = st.text_input("Artist Name", placeholder="e.g. Diljit Dosanjh", key="typed_artist")
-            with c2: typed_title = st.text_input("Track Title", placeholder="e.g. Lover", key="typed_title")
+            with c1:
+                typed_artist = st.text_input("Artist Name", placeholder="e.g. The Weeknd", key="typed_artist")
+            with c2:
+                typed_title = st.text_input("Track Title", placeholder="e.g. Blinding Lights", key="typed_title")
 
             st.markdown('<div class="tf-search-btn">', unsafe_allow_html=True)
             search_clicked = st.button("🔍 Search Track", use_container_width=True, key="search_track_btn")
@@ -657,6 +1205,12 @@ with tab_discover:
 
             yt_key = get_youtube_api_key()
 
+            # NOTE: `search_clicked` is only True on the exact script run where
+            # the button was pressed — it resets to False on every later rerun
+            # (e.g. when the user types into a fallback confirm field below).
+            # We persist the "a search was performed" state separately so the
+            # results/fallback UI doesn't vanish the instant the user
+            # interacts with anything else on the page.
             if search_clicked:
                 display_query = f"{typed_artist} {typed_title}".strip()
                 query = build_music_search_query(typed_artist, typed_title)
@@ -673,14 +1227,20 @@ with tab_discover:
                             candidates = search_youtube_tracks(query, yt_key, max_results=5)
                         st.session_state.search_candidates = candidates
                     else:
+                        # No YouTube key — smart fallback: skip real search,
+                        # treat the typed values as a single confirmable
+                        # candidate so the verification step still exists.
                         st.session_state.search_candidates = []
 
             search_performed = st.session_state.get("search_performed", False)
 
+            # ---- Render candidate results (real search) ----
             if st.session_state.search_candidates:
                 display_query = st.session_state.get("last_search_display_query") or st.session_state.last_search_query
                 st.caption(f"Top matches for **{display_query}** — confirm the exact track:")
-                option_labels = [f"{cand['title']}  ·  {cand['channel']}" for cand in st.session_state.search_candidates]
+                option_labels = []
+                for cand in st.session_state.search_candidates:
+                    option_labels.append(f"{cand['title']}  ·  {cand['channel']}")
 
                 chosen_label = st.radio(
                     "Select the exact track",
@@ -691,37 +1251,123 @@ with tab_discover:
                 chosen_idx = option_labels.index(chosen_label) if chosen_label in option_labels else 0
                 chosen = st.session_state.search_candidates[chosen_idx]
 
-                st.markdown(f'<div class="tf-candidate"><img src="{chosen["thumbnail"]}"><div><p class="tf-candidate-title">{chosen["title"]}</p><p class="tf-candidate-channel">{chosen["channel"]}</p></div></div>', unsafe_allow_html=True)
+                # Show a small thumbnail preview card for the highlighted pick
+                st.markdown(
+                    f"""
+                    <div class="tf-candidate">
+                        <img src="{chosen['thumbnail']}" alt="thumbnail">
+                        <div>
+                            <p class="tf-candidate-title">{chosen['title']}</p>
+                            <p class="tf-candidate-channel">{chosen['channel']}</p>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
                 if st.button("✅ Confirm This Track", use_container_width=True, key="confirm_candidate_btn"):
                     cleaned = clean_youtube_title(chosen["title"])
                     guess = split_artist_title_regex(cleaned)
                     confirmed_artist = guess.artist or typed_artist
                     confirmed_title = guess.title or typed_title or cleaned
-                    st.session_state.confirmed_seed = {"artist": confirmed_artist, "title": confirmed_title, "video_id": chosen["video_id"]}
-                    st.session_state.now_playing = {"Song": confirmed_title, "Artist": confirmed_artist, "video_id": chosen["video_id"]}
+                    st.session_state.confirmed_seed = {
+                        "artist": confirmed_artist,
+                        "title": confirmed_title,
+                        "video_id": chosen["video_id"],
+                    }
+                    # Instant playback the moment a track is confirmed.
+                    st.session_state.now_playing = {
+                        "Song": confirmed_title,
+                        "Artist": confirmed_artist,
+                        "video_id": chosen["video_id"],
+                    }
                     st.toast(f"Confirmed: {confirmed_title} — {confirmed_artist} ✅", icon="🎯")
                     st.rerun()
 
+            elif search_performed and not yt_key:
+                # Smart fallback when no YOUTUBE_API_KEY is configured: a
+                # clean manual confirmation step instead of real candidates.
+                st.info(
+                    "No `YOUTUBE_API_KEY` configured, so TrackFind can't pull real search "
+                    "matches. Confirm the details below to proceed anyway:"
+                )
+                fb_artist = st.text_input("Confirm Artist", value=typed_artist, key="fallback_artist")
+                fb_title = st.text_input("Confirm Track Title", value=typed_title, key="fallback_title")
+                if st.button("✅ Confirm This Track", use_container_width=True, key="confirm_fallback_btn"):
+                    st.session_state.confirmed_seed = {
+                        "artist": fb_artist,
+                        "title": fb_title,
+                        "video_id": "",
+                    }
+                    st.session_state.now_playing = {
+                        "Song": fb_title,
+                        "Artist": fb_artist,
+                        "video_id": "",
+                    }
+                    st.session_state.search_performed = False
+                    st.toast(f"Confirmed: {fb_title} — {fb_artist} ✅", icon="🎯")
+                    st.rerun()
+
+            elif search_performed and yt_key and not st.session_state.search_candidates:
+                st.warning("No matches found on YouTube for that search. Try simplifying the query, or confirm manually below.")
+                fb_artist = st.text_input("Confirm Artist", value=typed_artist, key="fallback_artist_noresults")
+                fb_title = st.text_input("Confirm Track Title", value=typed_title, key="fallback_title_noresults")
+                if st.button("✅ Confirm This Track", use_container_width=True, key="confirm_fallback_noresults_btn"):
+                    st.session_state.confirmed_seed = {
+                        "artist": fb_artist,
+                        "title": fb_title,
+                        "video_id": "",
+                    }
+                    st.session_state.now_playing = {
+                        "Song": fb_title,
+                        "Artist": fb_artist,
+                        "video_id": "",
+                    }
+                    st.session_state.search_performed = False
+                    st.toast(f"Confirmed: {fb_title} — {fb_artist} ✅", icon="🎯")
+                    st.rerun()
+
+            # ---- Show current confirmation status ----
             if st.session_state.confirmed_seed:
                 cs = st.session_state.confirmed_seed
                 st.success(f"🎯 Locked in: **{cs['title']}** — *{cs['artist']}*")
-                seed_artist, seed_title, seed_video_id = cs["artist"], cs["title"], cs["video_id"]
+                seed_artist, seed_title = cs["artist"], cs["title"]
+                seed_video_id = cs.get("video_id", "")
             else:
+                # Allow generating straight from typed fields too (search is
+                # a recommended verification step, not a hard gate), but
+                # nudge the user toward it.
                 seed_artist, seed_title = typed_artist, typed_title
+                if (typed_artist or typed_title) and not search_performed:
+                    st.caption("💡 Tip: click **🔍 Search Track** to verify the exact match before generating recommendations.")
 
+        # ===================================================================
+        # MODE B: 🔗 YouTube Link  ([BUG FIX] Instant playback + tiered parsing)
+        # ===================================================================
         else:
-            yt_url = st.text_input("YouTube Link", placeholder="https://www.youtube.com/watch?v=...", key="yt_url_input")
+            yt_url = st.text_input(
+                "YouTube Link",
+                placeholder="https://www.youtube.com/watch?v=...",
+                key="yt_url_input",
+            )
 
             if yt_url:
+                # Only re-parse when the URL actually changes, to avoid
+                # re-fetching/re-parsing on every unrelated widget rerun.
                 if st.session_state.get("_last_parsed_url") != yt_url:
                     with st.spinner("Parsing YouTube link..."):
                         seed = parse_youtube_link(yt_url)
                     st.session_state["_last_parsed_seed"] = asdict(seed)
                     st.session_state["_last_parsed_url"] = yt_url
 
+                    # [BUG FIX 2] Update the player THE MOMENT we have a
+                    # video_id — independent of clicking Generate.
                     if seed.video_id:
-                        st.session_state.now_playing = {"Song": seed.title, "Artist": seed.artist, "video_id": seed.video_id}
+                        st.session_state.now_playing = {
+                            "Song": seed.title,
+                            "Artist": seed.artist,
+                            "video_id": seed.video_id,
+                        }
 
                 parsed = st.session_state.get("_last_parsed_seed", {})
                 seed_video_id = parsed.get("video_id", "")
@@ -736,25 +1382,56 @@ with tab_discover:
                         if parse_confidence == "refined"
                         else '<span class="tf-confidence-pill tf-confidence-high">Auto-detected</span>'
                     )
-                    st.markdown(f"✅ Detected: **{seed_title_default}** — *{seed_artist_default or 'Unknown artist'}* {confidence_badge}", unsafe_allow_html=True)
+                    st.markdown(
+                        f"✅ Detected: **{seed_title_default}** — *{seed_artist_default or 'Unknown artist'}* {confidence_badge}",
+                        unsafe_allow_html=True,
+                    )
+                    if not seed_artist_default:
+                        st.caption("Couldn't separate the artist automatically — feel free to refine below.")
 
                     seed_artist = st.text_input("Confirm / edit Artist", value=seed_artist_default, key="yt_artist_confirm")
                     seed_title = st.text_input("Confirm / edit Track Title", value=seed_title_default, key="yt_title_confirm")
 
+                    # If the user hand-edits the fields, keep the player in
+                    # sync with whatever is currently shown.
                     if st.session_state.now_playing and st.session_state.now_playing.get("video_id") == seed_video_id:
                         st.session_state.now_playing["Song"] = seed_title
                         st.session_state.now_playing["Artist"] = seed_artist
 
-        st.markdown("<hr class='tf-divider'>", unsafe_allow_html=True)
-        st.markdown('<div class="tf-card-title">🎛️ Recommendation Controls</div>', unsafe_allow_html=True)
-        num_recs = st.slider("How many recommendations do you want?", 5, 50, 10, step=1, key="recs_slider")
+                elif seed_video_id:
+                    st.warning("⚠️ Found the video but couldn't auto-extract a clean title. Please enter details manually — the original video link will still be used for preview.")
+                    seed_artist = st.text_input("Artist Name (manual)", key="yt_artist_manual")
+                    seed_title = st.text_input("Track Title (manual)", key="yt_title_manual")
+                else:
+                    st.warning("⚠️ That doesn't look like a valid YouTube link. Please enter details manually.")
+                    seed_artist = st.text_input("Artist Name (manual)", key="yt_artist_manual")
+                    seed_title = st.text_input("Track Title (manual)", key="yt_title_manual")
 
-        st.markdown(f"""<span class="tf-stat-chip">{num_recs}<span>tracks requested</span></span>""", unsafe_allow_html=True)
+        st.markdown("<hr class='tf-divider'>", unsafe_allow_html=True)
+
+        st.markdown('<div class="tf-card-title">🎛️ Recommendation Controls</div>', unsafe_allow_html=True)
+        num_recs = st.slider(
+            "How many recommendations do you want?",
+            min_value=5,
+            max_value=50,
+            value=10,
+            step=1,
+            help="Scale from a quick 5-track sample to a full 50-track deep dive.",
+        )
+
+        st.markdown(
+            f"""<span class="tf-stat-chip">{num_recs}<span>tracks requested</span></span>""",
+            unsafe_allow_html=True,
+        )
+
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown('<div class="tf-primary-btn">', unsafe_allow_html=True)
-        generate_clicked = st.button("✨ Generate Recommendations", use_container_width=True, key="generate_btn")
-        st.markdown('</div></div>', unsafe_allow_html=True)
+        generate_clicked = st.button("✨ Generate Recommendations", use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
+        st.markdown('</div>', unsafe_allow_html=True)  # close tf-card
+
+        # -------------------- GENERATE LOGIC --------------------
         if generate_clicked:
             if not seed_title and not seed_artist:
                 st.error("Please provide at least a track title or artist name before generating recommendations.")
@@ -765,11 +1442,20 @@ with tab_discover:
                     st.session_state.recommendations = results
                     st.session_state.has_generated = True
                     st.session_state.last_seed = {"artist": seed_artist, "title": seed_title}
-                    st.session_state.now_playing = {"Song": seed_title, "Artist": seed_artist, "video_id": seed_video_id}
-                    st.rerun()
+                    st.session_state.now_playing = {
+                        "Song": seed_title,
+                        "Artist": seed_artist,
+                        "video_id": seed_video_id,
+                    }
+                    model_used = st.session_state.get("working_model", GEMINI_MODEL)
+                    st.success(f"🎉 Generated {len(results)} recommendations based on '{seed_title or seed_artist}'!")
+                    st.caption(f"Served by `{model_used}`")
+                except RuntimeError as e:
+                    st.error(f"⚠️ {e}")
                 except Exception as e:
-                    st.error(f"⚠️ Error: {e}")
+                    st.error(f"⚠️ Something went wrong while contacting Gemini: {e}")
 
+    # -------------------- RIGHT COLUMN: PLAYBACK PREVIEW --------------------
     with col_player:
         st.markdown('<div class="tf-card">', unsafe_allow_html=True)
         st.markdown('<div class="tf-card-title">▶️ Now Sampling</div>', unsafe_allow_html=True)
@@ -784,6 +1470,11 @@ with tab_discover:
             st.markdown(f"**{song}**")
             st.markdown(f"<span class='tf-subtle'>{artist}</span>", unsafe_allow_html=True)
 
+            # If we don't already have a confirmed video (e.g. this came from
+            # an AI recommendation or manual typing rather than a pasted
+            # link or confirmed search result), try to auto-resolve a real
+            # one via the YouTube Data API — but only if that optional key
+            # is configured.
             if not video_id:
                 yt_key = get_youtube_api_key()
                 if yt_key:
@@ -793,21 +1484,52 @@ with tab_discover:
                             resolved_id = search_youtube_video_id(query, yt_key)
                         if resolved_id:
                             video_id = resolved_id
+                            # Cache the resolution on now_playing so we don't
+                            # re-search on every rerun of the script.
                             st.session_state.now_playing["video_id"] = resolved_id
 
             if video_id:
-                st.video(build_youtube_watch_url(video_id))
+                # We have a real, confirmed YouTube video — this embeds and
+                # plays directly inline.
+                watch_url = build_youtube_watch_url(video_id)
+                st.video(watch_url)
                 st.caption("🔊 Now playing.")
             else:
+                # No confirmed video and no YouTube key configured (or the
+                # search came up empty) — st.video() cannot play a
+                # search-results page, so offer a clear, honest link instead
+                # of a broken embed.
                 query = f"{artist} {song}".strip()
                 search_url = build_youtube_search_url(query) if query else ""
-                st.markdown('<div class="tf-empty-state" style="padding:1.6rem 1rem;"><span class="tf-emoji">🔎</span>No direct video found for this track yet.</div>', unsafe_allow_html=True)
+                st.markdown(
+                    """
+                    <div class="tf-empty-state" style="padding:1.6rem 1rem;">
+                        <span class="tf-emoji">🔎</span>
+                        No direct video found for this track yet.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
                 if search_url:
                     st.link_button("🔗 Find & play on YouTube", search_url, use_container_width=True)
+                if not get_youtube_api_key():
+                    st.caption("Tip: add a free YOUTUBE_API_KEY to enable automatic inline playback for every recommendation.")
+                else:
+                    st.caption("No matching video was found automatically — try the link above.")
         else:
-            st.markdown('<div class="tf-empty-state"><span class="tf-emoji">🎶</span>Generate recommendations or pick a track below to preview it here.</div>', unsafe_allow_html=True)
+            st.markdown(
+                """
+                <div class="tf-empty-state">
+                    <span class="tf-emoji">🎶</span>
+                    Generate recommendations or pick a track below to preview it here.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
         st.markdown('</div>', unsafe_allow_html=True)
 
+    # -------------------- RECOMMENDATIONS LIST --------------------
     st.markdown("<hr class='tf-divider'>", unsafe_allow_html=True)
 
     if st.session_state.recommendations:
@@ -822,7 +1544,17 @@ with tab_discover:
             with row:
                 c_info, c_play, c_add = st.columns([5, 1, 1.3])
                 with c_info:
-                    st.markdown(f'<div class="tf-track"><span class="tf-badge">#{idx + 1}</span><p class="tf-track-song">{song}</p><p class="tf-track-artist">{artist}</p><p class="tf-track-reason">💡 {reason}</p></div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f"""
+                        <div class="tf-track">
+                            <span class="tf-badge">#{idx + 1}</span>
+                            <p class="tf-track-song">{song}</p>
+                            <p class="tf-track-artist">{artist}</p>
+                            <p class="tf-track-reason">💡 {reason}</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
                 with c_play:
                     if st.button("▶️ Play", key=f"play_{idx}"):
                         st.session_state.now_playing = {"Song": song, "Artist": artist, "video_id": ""}
@@ -830,54 +1562,113 @@ with tab_discover:
                 with c_add:
                     if st.button("➕ Add to Playlist", key=f"add_{idx}"):
                         add_to_playlist({"Song": song, "Artist": artist, "Reason": reason})
+
     elif st.session_state.has_generated:
         st.info("No recommendations were returned. Try a different seed track.")
     else:
-        st.markdown('<div class="tf-empty-state"><span class="tf-emoji">🧭</span>Your recommendations will appear here once you generate them above.</div>', unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div class="tf-empty-state">
+                <span class="tf-emoji">🧭</span>
+                Your recommendations will appear here once you generate them above.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
+
+# ---------------------------------------------------------------------------
+# TAB 2: MY PLAYLIST VAULT
+# ---------------------------------------------------------------------------
 with tab_vault:
     vault = st.session_state.playlist_vault
 
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        st.markdown(f"""<span class="tf-stat-chip">{len(vault)}<span>saved tracks</span></span>""", unsafe_allow_html=True)
+        st.markdown(
+            f"""<span class="tf-stat-chip">{len(vault)}<span>saved tracks</span></span>""",
+            unsafe_allow_html=True,
+        )
     with col_b:
         unique_artists = len({t["Artist"] for t in vault}) if vault else 0
-        st.markdown(f"""<span class="tf-stat-chip">{unique_artists}<span>unique artists</span></span>""", unsafe_allow_html=True)
+        st.markdown(
+            f"""<span class="tf-stat-chip">{unique_artists}<span>unique artists</span></span>""",
+            unsafe_allow_html=True,
+        )
 
     st.markdown("<hr class='tf-divider'>", unsafe_allow_html=True)
+
     col_list, col_export = st.columns([1.4, 1], gap="large")
 
+    # -------------------- SAVED TRACKS LIST --------------------
     with col_list:
         st.markdown('<div class="tf-card">', unsafe_allow_html=True)
         st.markdown('<div class="tf-card-title">💾 Saved Tracks</div>', unsafe_allow_html=True)
 
         if not vault:
-            st.markdown('<div class="tf-empty-state"><span class="tf-emoji">📭</span>Your vault is empty. Head to "Discover &amp; Sync" and add some tracks!</div>', unsafe_allow_html=True)
+            st.markdown(
+                """
+                <div class="tf-empty-state">
+                    <span class="tf-emoji">📭</span>
+                    Your vault is empty. Head to "Discover &amp; Sync" and add some tracks!
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
         else:
             for i, track in enumerate(vault):
                 r1, r2, r3 = st.columns([4.2, 0.9, 0.9])
                 with r1:
-                    st.markdown(f'<div class="tf-vault-row"><div><span class="tf-vault-title">{track.get("Song","")}</span><br><span class="tf-vault-artist">{track.get("Artist","")}</span></div></div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f"""
+                        <div class="tf-vault-row">
+                            <div>
+                                <span class="tf-vault-title">{track.get('Song','')}</span><br>
+                                <span class="tf-vault-artist">{track.get('Artist','')}</span>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
                 with r2:
                     if st.button("▶️", key=f"vault_play_{i}", help="Preview this track"):
-                        st.session_state.now_playing = {"Song": track.get("Song", ""), "Artist": track.get("Artist", ""), "video_id": ""}
+                        st.session_state.now_playing = {
+                            "Song": track.get("Song", ""),
+                            "Artist": track.get("Artist", ""),
+                            "video_id": "",
+                        }
                         st.toast("Switched preview — check the Discover tab. 🎧")
                 with r3:
                     if st.button("🗑️", key=f"vault_remove_{i}", help="Remove from vault"):
-                        st.session_state.playlist_vault.pop(i)
+                        remove_from_playlist(i)
                         st.rerun()
+
         st.markdown('</div>', unsafe_allow_html=True)
 
+    # -------------------- EXPORT TOOLS --------------------
     with col_export:
         st.markdown('<div class="tf-card">', unsafe_allow_html=True)
         st.markdown('<div class="tf-card-title">📤 Export &amp; Manage</div>', unsafe_allow_html=True)
 
         if vault:
-            st.download_button(label="⬇️ Download CSV", data=playlist_to_csv_bytes(), file_name="trackfind_playlist.csv", mime="text/csv", use_container_width=True)
+            csv_bytes = playlist_to_csv_bytes()
+            st.download_button(
+                label="⬇️ Download CSV",
+                data=csv_bytes,
+                file_name="trackfind_playlist.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
             st.markdown("<br>", unsafe_allow_html=True)
             st.caption("Copy-paste tracklist:")
-            st.text_area("Markdown tracklist", value=playlist_to_markdown(), height=220, label_visibility="collapsed")
+            st.text_area(
+                "Markdown tracklist",
+                value=playlist_to_markdown(),
+                height=220,
+                label_visibility="collapsed",
+            )
+
             st.markdown("<br>", unsafe_allow_html=True)
             confirm_clear = st.checkbox("Confirm: I want to clear my playlist")
             if st.button("🧹 Clear Playlist", use_container_width=True, disabled=not confirm_clear):
@@ -886,6 +1677,18 @@ with tab_vault:
                 st.rerun()
         else:
             st.caption("Add tracks to your vault to unlock export options.")
+
         st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown('<div style="text-align:center; padding: 1.5rem 0 0.5rem 0; color:#5C7A73; font-size:0.78rem;">Built with Streamlit &amp; Google Gemini · TrackFind © 2026</div>', unsafe_allow_html=True)
+
+# ===========================================================================
+# 11. FOOTER
+# ===========================================================================
+st.markdown(
+    """
+    <div style="text-align:center; padding: 1.5rem 0 0.5rem 0; color:#5C7A73; font-size:0.78rem;">
+        Built with Streamlit &amp; Google Gemini · TrackFind © 2026
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
