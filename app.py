@@ -33,6 +33,19 @@ QA / PM CHANGELOG (this revision):
               (multiple pipes/dashes, e.g. corporate Bollywood/Punjabi
               uploads) are flagged low-confidence and refined with a tiny
               Gemini call so Artist/Title no longer get scrambled.
+    [BUG FIX] refine_title_with_gemini's prompt now explicitly teaches the
+              model to (a) honor explicit "Song:"/"Movie:"/"Singer:"/"Track:"
+              labels when present, and (b) apply clear structural/positional
+              rules (title is usually the last segment, esp. after a dash;
+              a short standalone proper-noun middle segment is the movie/
+              album, never the title) — fixes cases where the movie name and
+              song title were getting inverted on complex regional uploads.
+    [UX FIX]  "🔍 Search Track" now appends music-context keywords to the
+              query behind the scenes (e.g. "official audio music song")
+              when the user provides a sparse query (single keyword or
+              artist-only), so YouTube search no longer surfaces unrelated
+              talk-show clips, shorts, or OTT promo content instead of
+              actual songs.
 """
 
 import os
@@ -528,9 +541,9 @@ class RecommendationList(BaseModel):
 
 
 class ParsedTitle(BaseModel):
-    """Strict schema for the Gemini micro-parse fallback (Bug Fix #3)."""
-    artist: str = Field(description="The primary recording artist's name only — no featured artists, no album/playlist names, no promotional text.")
-    title: str = Field(description="The actual song title only — no movie/album name, no language or genre tags, no promotional text.")
+    """Strict schema for the Gemini micro-parse fallback (Bug Fix #3 / #5)."""
+    artist: str = Field(description="The primary recording singer/artist's name only — a person or group, never a movie/film/album name, no featured artists, no promotional text.")
+    title: str = Field(description="The actual standalone song title only — never a movie/film/album name, never a language or genre tag, no promotional text.")
 
 
 @dataclass
@@ -556,7 +569,8 @@ def init_session_state():
         "working_model": None,          # whichever Gemini model actually succeeded
         "search_candidates": [],        # list of dicts from YouTube search, for Feature 1
         "confirmed_seed": None,         # dict: {"artist":..., "title":..., "video_id":...} once user confirms a candidate
-        "last_search_query": "",        # tracks what the candidates were searched for
+        "last_search_query": "",        # actual augmented query sent to YouTube search
+        "last_search_display_query": "",  # clean user-facing version (no injected keywords)
         "search_performed": False,      # persists across reruns (fixes a transient-button-state bug)
     }
     for key, val in defaults.items():
@@ -756,20 +770,62 @@ def refine_title_with_gemini(messy_title: str) -> Optional[ParsedTitle]:
     main recommendation engine — it does not consume the recommendation
     model-fallback chain and fails silently (returns None) so callers always
     have the regex guess as a safety net.
+
+    [BUG FIX] Earlier revisions used a loosely-worded prompt that could
+    invert the movie/album name and the song title on complex regional
+    (Bollywood/Punjabi-style) uploads — e.g. mistaking a short film name
+    like "Sargi" for the song title and the real title "Fer Ohi Hoyea" for
+    something else. This prompt now (1) prioritizes explicit "Song:"/
+    "Movie:"/"Singer:"/"Track:" labels when present, and (2) gives the model
+    concrete structural/positional heuristics for titles with no explicit
+    labels, plus a self-check step before answering.
     """
     client = get_genai_client()
     if client is None:
         return None
 
     prompt = f"""
-Extract the real recording artist and the real song title from this messy
-YouTube video title. Ignore featured/secondary artists, album or movie
-names, playlist names, language/genre tags (e.g. "Latest Punjabi Song"),
-and any promotional text.
+You are a metadata extraction specialist for music video titles, especially
+Bollywood, Punjabi, and other South Asian regional film/music uploads where
+the singer, movie/film name, genre tag, and song title are often mixed
+together in inconsistent order with "|" or "-"/"—" as separators.
 
 Raw title: "{messy_title}"
 
-Return only the primary artist and the actual song title.
+STEP 1 — Check for explicit key-value labels first.
+If the text contains explicit indicators such as "Song:", "Track:",
+"Singer:", "Artist:", "Movie:", or "Film:", these are AUTHORITATIVE — use the
+value following "Song:" or "Track:" as the title, and the value following
+"Singer:" or "Artist:" as the artist, regardless of where they appear in the
+string. Ignore the value following "Movie:" or "Film:" entirely — that is
+never the artist or the title.
+
+STEP 2 — If there are no explicit labels, use structural reasoning instead:
+- The SONG TITLE is almost always the LAST segment in the string, especially
+  if it immediately follows a dash ("-", "–", or "—") near the end.
+- The PRIMARY SINGER/ARTIST is almost always the FIRST segment. If that
+  segment lists multiple names separated by a comma, the first name is
+  usually the singer and the remaining names are usually featured artists or
+  film actors — prefer the first name as the primary artist.
+- A SHORT middle segment that is just one or two words and reads like a
+  single proper noun (e.g. a short film/movie name) is almost always the
+  MOVIE or ALBUM name, NOT the song title — even though its brevity might
+  make it look like a plausible title. Movie/album names must never be
+  returned as either the artist or the title.
+- A segment containing generic filler like "Latest", "New", "Punjabi Song",
+  "Hindi Song", "Bollywood", "Official", "Full Video", "Full Song", or a
+  bare year is pure noise — discard it; it is never the artist or the title.
+
+STEP 3 — Self-check before answering:
+- Is the artist you chose an actual person or group name? If it looks like a
+  movie/film/album name instead, you picked the wrong segment — go back and
+  find the real singer, usually the first segment.
+- Is the title you chose the actual song name? If it looks like a short
+  film/movie name or a generic genre/language tag instead, you picked the
+  wrong segment — go back and find the real song title, usually the last
+  segment, often right after a dash.
+
+Return ONLY the primary singer/artist and the actual standalone song title.
 """.strip()
 
     try:
@@ -822,6 +878,34 @@ def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
             seed.parse_confidence = "refined"
 
     return seed
+
+
+def build_music_search_query(typed_artist: str, typed_title: str) -> str:
+    """
+    [UX FIX] Constructs the YouTube search query used by the "🔍 Search
+    Track" verification step. A bare single-keyword query (e.g. just
+    "diljit" or just "aha") returns broad, irrelevant results from YouTube's
+    general search — talk-show clips, Shorts, or even OTT platform promos
+    (e.g. the "aha" streaming service) instead of actual songs.
+
+    To keep results strictly music-focused without requiring the user to
+    type anything extra, this appends explicit audio/music modifiers behind
+    the scenes:
+        - Artist only            -> "<artist> official audio music song"
+        - Title only              -> "<title> official audio music song"
+        - Both artist and title   -> "<artist> <title> song"
+        - Neither                 -> "" (caller handles the empty case)
+    """
+    typed_artist = (typed_artist or "").strip()
+    typed_title = (typed_title or "").strip()
+
+    if typed_artist and typed_title:
+        return f"{typed_artist} {typed_title} song"
+    if typed_artist and not typed_title:
+        return f"{typed_artist} official audio music song"
+    if typed_title and not typed_artist:
+        return f"{typed_title} official audio music song"
+    return ""
 
 
 def build_youtube_search_url(query: str) -> str:
@@ -1128,13 +1212,15 @@ with tab_discover:
             # results/fallback UI doesn't vanish the instant the user
             # interacts with anything else on the page.
             if search_clicked:
-                query = f"{typed_artist} {typed_title}".strip()
+                display_query = f"{typed_artist} {typed_title}".strip()
+                query = build_music_search_query(typed_artist, typed_title)
                 if not query:
                     st.error("Type an artist name and/or track title before searching.")
                     st.session_state.search_performed = False
                 else:
                     st.session_state.confirmed_seed = None
                     st.session_state.last_search_query = query
+                    st.session_state.last_search_display_query = display_query
                     st.session_state.search_performed = True
                     if yt_key:
                         with st.spinner("Searching for matching tracks..."):
@@ -1150,7 +1236,8 @@ with tab_discover:
 
             # ---- Render candidate results (real search) ----
             if st.session_state.search_candidates:
-                st.caption(f"Top matches for **{st.session_state.last_search_query}** — confirm the exact track:")
+                display_query = st.session_state.get("last_search_display_query") or st.session_state.last_search_query
+                st.caption(f"Top matches for **{display_query}** — confirm the exact track:")
                 option_labels = []
                 for cand in st.session_state.search_candidates:
                     option_labels.append(f"{cand['title']}  ·  {cand['channel']}")
