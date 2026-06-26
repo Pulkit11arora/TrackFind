@@ -436,7 +436,6 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # ===========================================================================
 
 class RecommendedTrack(BaseModel):
-    """Strict schema Gemini must follow for every recommendation."""
     Song: str = Field(description="The title of the recommended track.")
     Artist: str = Field(description="The artist name.")
     Reason: str = Field(description="A short, clear explanation of WHY this song was chosen.")
@@ -447,48 +446,47 @@ class RecommendationList(BaseModel):
 
 
 class ParsedTitle(BaseModel):
-    """Strict schema for the Gemini structural metadata isolation pipeline."""
-    artist: str = Field(description="The true recording singer/artist name ONLY. Absolutely NO movie/film names, NO album titles, and NO platform descriptor text.")
-    title: str = Field(description="The actual standalone track or song title ONLY. Absolutely NO movie titles, NO genre clutter, and NO packaging text.")
+    artist: str = Field(description="The primary recording singer/artist's name only — a person or group, never a movie/film/album name, no featured artists, no promotional text.")
+    title: str = Field(description="The actual standalone song title only — never a movie/film/album name, never a language or genre tag, no promotional text.")
 
 
 @dataclass
 class SeedTrack:
     artist: str = ""
     title: str = ""
-    raw_source: str = ""
-    video_id: str = ""
-    parse_confidence: str = "high"
+    raw_source: str = ""   
+    video_id: str = ""     
+    parse_confidence: str = "high" 
 
 
 # ===========================================================================
-# 5. SESSION STATE INITIALIZATION
+# 5. CORE HELPER CODES & UTILITIES (DEFINED FIRST FOR PYTHON PARSING)
 # ===========================================================================
 
-def init_session_state():
-    defaults = {
-        "recommendations": [],
-        "playlist_vault": [],
-        "now_playing": None,
-        "last_seed": None,
-        "has_generated": False,
-        "working_model": None,
-        "search_candidates": [],
-        "confirmed_seed": None,
-        "last_search_query": "",
-        "last_search_display_query": "",
-        "search_performed": False,
-    }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
+def get_genai_client() -> Optional[genai.Client]:
+    api_key = get_api_key()
+    if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
+        return None
+    try:
+        return genai.Client(api_key=api_key)
+    except Exception:
+        return None
 
 
-init_session_state()
+def render_hero():
+    st.markdown(
+        f"""
+        <div class="tf-hero">
+            <h1>{APP_TITLE}</h1>
+            <p>Discover your next favorite track — powered by Gemini AI, styled for the way you actually listen.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ===========================================================================
-# 6. YOUTUBE LINK PARSING / QUERY REFINEMENT ENGINE
+# 6. YOUTUBE LINK PARSING / CLEANING LOGIC
 # ===========================================================================
 
 YOUTUBE_ID_PATTERNS = [
@@ -504,8 +502,7 @@ FLUFF_PATTERNS = [
     r"\(\s*lyric\s*video\s*\)", r"\[\s*lyric\s*video\s*\]",
     r"\(\s*audio\s*\)", r"\[\s*audio\s*\]",
     r"\(\s*visualizer\s*\)", r"\[\s*visualizer\s*\]",
-    r"\(\s*hd\s*\)", r"\[\s*hd\s*\]", r"\(\s*4k\s*\)", r"\[\s*4k\s*\]",
-    r"\(\s*hq\s*\)", r"\[\s*hq\s*\]",
+    r"\(\s*hd\s*\)", r"\[\s*hd\s*\]", r"\(\s*4k\s*\)", r"\[\s*4k\s*\]", r"\(\s*hq\s*\)", r"\[\s*hq\s*\]",
     r"\(\s*full\s*video\s*\)", r"\[\s*full\s*video\s*\]",
     r"\(\s*full\s*song\s*\)", r"\[\s*full\s*song\s*\]",
     r"\bofficial\s*video\b", r"\bofficial\s*audio\b",
@@ -517,31 +514,11 @@ FLUFF_PATTERNS = [
 ]
 
 FLUFF_REGEX = re.compile("|".join(FLUFF_PATTERNS), flags=re.IGNORECASE)
-
 NOISE_SEGMENT_PATTERNS = [
     r"^(latest|new|hit|top|best)?\s*(punjabi|hindi|bollywood|english|haryanvi)?\s*song(s)?\s*\d*$",
     r"^official\s*(video|audio)?$",
 ]
 NOISE_SEGMENT_REGEX = re.compile("|".join(NOISE_SEGMENT_PATTERNS), flags=re.IGNORECASE)
-
-
-def extract_youtube_id(url: str) -> Optional[str]:
-    for pattern in YOUTUBE_ID_PATTERNS:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
-
-
-def fetch_youtube_title(video_id: str) -> Optional[str]:
-    try:
-        import urllib.request
-        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-        with urllib.request.urlopen(oembed_url, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("title")
-    except Exception:
-        return None
 
 
 def clean_youtube_title(raw_title: str) -> str:
@@ -597,36 +574,62 @@ def split_artist_title_regex(cleaned_title: str) -> SeedTrack:
 
 
 def refine_title_with_gemini(messy_title: str) -> Optional[ParsedTitle]:
-    """[🔥 FIXED] Correctly passes the optimized multi-tiered semantic structural prompt payload into the active SDK client."""
     client = get_genai_client()
     if client is None:
         return None
 
-    prompt_payload = f"""
-You are a structural metadata extraction specialist for regional music video titles (Bollywood, Punjabi, South Asian).
-Your task is to parse a text title string and isolate the clear standalone track/song name and the true recording singer/artist.
+    prompt = f"""
+You are a metadata extraction specialist for music video titles, especially
+Bollywood, Punjabi, and other South Asian regional film/music uploads where
+the singer, movie/film name, genre tag, and song title are often mixed
+together in inconsistent order with "|" or "-"/"—" as separators.
 
-Raw title to process: "{messy_title}"
+Raw title: "{messy_title}"
 
-CRITICAL STRUCTURAL EXTRACTION HIERARCHY RULES:
-1. CHECK FOR LABELS: If the text contains labels like "Song:", "Track:", "Singer:", "Artist:", "Movie:", or "Film:", treat them as authoritative. The value following "Song:" or "Track:" is the title. The value following "Singer:" or "Artist:" is the artist. Discard anything following "Movie:" or "Film:" — it is never the track name.
-2. POSITION HEURISTICS (NO LABELS):
-   - The standalone SONG TITLE is almost always the LAST segment in the string sequence, following a trailing dash ("—" or "-").
-   - The SINGER/ARTIST name is almost always the FIRST segment. If multi-name lists exist, pick the first person listed as primary.
-   - Any standalone, isolated proper-noun middle segment (e.g. 'Sargi') represents the underlying Film/Movie or production album context. It must NEVER be mapped as the song title or recording artist.
-3. SELF-CHECK CORRECTION: Before completing the JSON payload object, verify that your extracted title is NOT a short movie title, and your artist is a verifiable performer, not an album or catalog indicator.
+STEP 1 — Check for explicit key-value labels first.
+If the text contains explicit indicators such as "Song:", "Track:",
+"Singer:", "Artist:", "Movie:", or "Film:", these are AUTHORITATIVE — use the
+value following "Song:" or "Track:" as the title, and the value following
+"Singer:" or "Artist:" as the artist, regardless of where they appear in the
+string. Ignore the value following "Movie:" or "Film:" entirely — that is
+never the artist or the title.
 
-Return strictly the structural JSON format output.
+STEP 2 — If there are no explicit labels, use structural reasoning instead:
+- The SONG TITLE is almost always the LAST segment in the string, especially
+  if it immediately follows a dash ("-", "–", or "—") near the end.
+- The PRIMARY SINGER/ARTIST is almost always the FIRST segment. If that
+  segment lists multiple names separated by a comma, the first name is
+  usually the singer and the remaining names are usually featured artists or
+  film actors — prefer the first name as the primary artist.
+- A SHORT middle segment that is just one or two words and reads like a
+  single proper noun (e.g. a short film/movie name like 'Sargi') is almost always the
+  MOVIE or ALBUM name, NOT the song title — even though its brevity might
+  make it look like a plausible title. Movie/album names must never be
+  returned as either the artist or the title.
+- A segment containing generic filler like "Latest", "New", "Punjabi Song",
+  "Hindi Song", "Bollywood", "Official", "Full Video", "Full Song", or a
+  bare year is pure noise — discard it; it is never the artist or the title.
+
+STEP 3 — Self-check before answering:
+- Is the artist you chose an actual person or group name? If it looks like a
+  movie/film/album name instead, you picked the wrong segment — go back and
+  find the real singer, usually the first segment.
+- Is the title you chose the actual song name? If it looks like a short
+  film/movie name or a generic genre/language tag instead, you picked the
+  wrong segment — go back and find the real song title, usually the last
+  segment, often right after a dash.
+
+Return ONLY the primary singer/artist and the actual standalone song title.
 """.strip()
 
     try:
         response = client.models.generate_content(
             model=st.session_state.get("working_model") or GEMINI_MODEL,
-            contents=prompt_payload,
+            contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=ParsedTitle,
-                temperature=0.0,
+                temperature=0.1,
                 max_output_tokens=256,
             ),
         )
@@ -667,16 +670,15 @@ def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
 
 
 def build_music_search_query(typed_artist: str, typed_title: str) -> str:
-    """[🔥 FIXED] Strips non-music junk formats like interviews or TV show clips out of broad developer inputs."""
-    artist_clean = (typed_artist or "").strip()
-    title_clean = (typed_title or "").strip()
+    typed_artist = (typed_artist or "").strip()
+    typed_title = (typed_title or "").strip()
 
-    if artist_clean and title_clean:
-        return f"{artist_clean} {title_clean} song"
-    if artist_clean and not title_clean:
-        return f"{artist_clean} official audio music song"
-    if title_clean and not artist_clean:
-        return f"{title_clean} official audio music song"
+    if typed_artist and typed_title:
+        return f"{typed_artist} {typed_title} song"
+    if typed_artist and not typed_title:
+        return f"{typed_artist} official audio music song"
+    if typed_title and not typed_artist:
+        return f"{typed_title} official audio music song"
     return ""
 
 
@@ -687,12 +689,6 @@ def build_youtube_search_url(query: str) -> str:
 
 def build_youtube_watch_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def search_youtube_video_id(query: str, api_key: str) -> Optional[str]:
-    results = search_youtube_tracks(query, api_key, max_results=1)
-    return results[0]["video_id"] if results else None
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
@@ -731,18 +727,10 @@ def search_youtube_tracks(query: str, api_key: str, max_results: int = 5) -> Lis
         return []
 
 
-# ===========================================================================
-# 7. GEMINI RECOMMENDATION ENGINE
-# ===========================================================================
-
-def get_genai_client() -> Optional[genai.Client]:
-    api_key = get_api_key()
-    if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
-        return None
-    try:
-        return genai.Client(api_key=api_key)
-    except Exception:
-        return None
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def search_youtube_video_id(query: str, api_key: str) -> Optional[str]:
+    results = search_youtube_tracks(query, api_key, max_results=1)
+    return results[0]["video_id"] if results else None
 
 
 def build_recommendation_prompt(artist: str, title: str, num_recs: int) -> str:
@@ -753,7 +741,7 @@ A user has provided this seed track:
     Artist: "{artist or 'Unknown'}"
     Title:  "{title or 'Unknown'}"
 
-Recommend exactly {num_recs} songs that a fan of this track would genuinely enjoy. Use a healthy mix of reasoning angles across the list — sonic/mood similarity, shared genre or subgenre, same era, shared collaborators or influences, similar tempo/instrumentation, or thematic/lyrical similarity.
+Recommend exactly {num_recs} songs that a fan of this track would genuinely enjoy.
 
 Rules:
 - Do NOT include the seed track itself in the results.
@@ -789,7 +777,7 @@ def _call_gemini_model(client: "genai.Client", model_name: str, prompt: str) -> 
 def get_recommendations(artist: str, title: str, num_recs: int) -> List[dict]:
     client = get_genai_client()
     if client is None:
-        raise RuntimeError("Gemini API key not configured. Add GEMINI_API_KEY to your dashboard settings secrets.")
+        raise RuntimeError("Gemini API key not configured. Add GEMINI_API_KEY to secrets.")
 
     prompt = build_recommendation_prompt(artist, title, num_recs)
 
@@ -811,12 +799,8 @@ def get_recommendations(artist: str, title: str, num_recs: int) -> List[dict]:
             if "404" not in error_str and "NOT_FOUND" not in error_str.upper():
                 raise
 
-    raise RuntimeError(f"None of the configured Gemini models are available for this API key. Last error: {last_error}")
+    raise RuntimeError(f"None of the configured Gemini models are available. Last error: {last_error}")
 
-
-# ===========================================================================
-# 8. HELPER UI FUNCTIONS
-# ===========================================================================
 
 def add_to_playlist(track: dict):
     existing = {(t["Song"].lower(), t["Artist"].lower()) for t in st.session_state.playlist_vault}
@@ -853,19 +837,15 @@ def playlist_to_markdown() -> str:
 
 
 # ===========================================================================
-# 9. RUN UI PRESENTATION
+# 10. APP INITIALIZATION & MAIN PAGE ROUTINES
 # ===========================================================================
 
 render_hero()
 tab_discover, tab_vault = st.tabs(["🔎  Discover & Sync", "🎧  My Playlist Vault"])
 
-# ---------------------------------------------------------------------------
-# TAB 1: DISCOVER & SYNC
-# ---------------------------------------------------------------------------
 with tab_discover:
     col_input, col_player = st.columns([1.35, 1], gap="large")
 
-    # -------------------- LEFT COLUMN: INPUT & CONTROLS --------------------
     with col_input:
         st.markdown('<div class="tf-card">', unsafe_allow_html=True)
         st.markdown('<div class="tf-card-title">🎯 Seed Track Input</div>', unsafe_allow_html=True)
@@ -886,11 +866,10 @@ with tab_discover:
 
         seed_artist, seed_title, seed_video_id = "", "", ""
 
-        # MODE A: Artist + Track
         if input_mode == "🎤 Artist + Track":
             c1, c2 = st.columns(2)
-            with c1: typed_artist = st.text_input("Artist Name", placeholder="e.g. The Weeknd", key="typed_artist")
-            with c2: typed_title = st.text_input("Track Title", placeholder="e.g. Blinding Lights", key="typed_title")
+            with c1: typed_artist = st.text_input("Artist Name", placeholder="e.g. Diljit Dosanjh", key="typed_artist")
+            with c2: typed_title = st.text_input("Track Title", placeholder="e.g. Lover", key="typed_title")
 
             st.markdown('<div class="tf-search-btn">', unsafe_allow_html=True)
             search_clicked = st.button("🔍 Search Track", use_container_width=True, key="search_track_btn")
@@ -923,7 +902,12 @@ with tab_discover:
                 st.caption(f"Top matches for **{display_query}** — confirm the exact track:")
                 option_labels = [f"{cand['title']}  ·  {cand['channel']}" for cand in st.session_state.search_candidates]
 
-                chosen_label = st.radio("Select the exact track", options=option_labels, label_visibility="collapsed", key="candidate_radio")
+                chosen_label = st.radio(
+                    "Select the exact track",
+                    options=option_labels,
+                    label_visibility="collapsed",
+                    key="candidate_radio",
+                )
                 chosen_idx = option_labels.index(chosen_label) if chosen_label in option_labels else 0
                 chosen = st.session_state.search_candidates[chosen_idx]
 
@@ -939,27 +923,13 @@ with tab_discover:
                     st.toast(f"Confirmed: {confirmed_title} — {confirmed_artist} ✅", icon="🎯")
                     st.rerun()
 
-            elif search_performed and not yt_key:
-                st.info("No `YOUTUBE_API_KEY` configured. Confirm details below to proceed anyway:")
-                fb_artist = st.text_input("Confirm Artist", value=typed_artist, key="fallback_artist")
-                fb_title = st.text_input("Confirm Track Title", value=typed_title, key="fallback_title")
-                if st.button("✅ Confirm This Track", use_container_width=True, key="confirm_fallback_btn"):
-                    st.session_state.confirmed_seed = {"artist": fb_artist, "title": fb_title, "video_id": ""}
-                    st.session_state.now_playing = {"Song": fb_title, "Artist": fb_artist, "video_id": ""}
-                    st.session_state.search_performed = False
-                    st.toast(f"Confirmed: {fb_title} — {fb_artist} ✅", icon="🎯")
-                    st.rerun()
-
             if st.session_state.confirmed_seed:
                 cs = st.session_state.confirmed_seed
                 st.success(f"🎯 Locked in: **{cs['title']}** — *{cs['artist']}*")
                 seed_artist, seed_title, seed_video_id = cs["artist"], cs["title"], cs["video_id"]
             else:
                 seed_artist, seed_title = typed_artist, typed_title
-                if (typed_artist or typed_title) and not search_performed:
-                    st.caption("💡 Tip: click **🔍 Search Track** to verify the exact match before generating recommendations.")
 
-        # MODE B: YouTube Link
         else:
             yt_url = st.text_input("YouTube Link", placeholder="https://www.youtube.com/watch?v=...", key="yt_url_input")
 
@@ -1018,12 +988,10 @@ with tab_discover:
                     st.session_state.now_playing = {"Song": seed_title, "Artist": seed_artist, "video_id": seed_video_id}
                     model_used = st.session_state.get("working_model", GEMINI_MODEL)
                     st.success(f"🎉 Generated {len(results)} recommendations based on '{seed_title or seed_artist}'!")
-                    st.caption(f"Served by `{model_used}`")
                     st.rerun()
                 except Exception as e:
                     st.error(f"⚠️ Error: {e}")
 
-    # -------------------- RIGHT COLUMN: PLAYBACK PREVIEW --------------------
     with col_player:
         st.markdown('<div class="tf-card">', unsafe_allow_html=True)
         st.markdown('<div class="tf-card-title">▶️ Now Sampling</div>', unsafe_allow_html=True)
@@ -1060,10 +1028,8 @@ with tab_discover:
                     st.link_button("🔗 Find & play on YouTube", search_url, use_container_width=True)
         else:
             st.markdown('<div class="tf-empty-state"><span class="tf-emoji">🎶</span>Generate recommendations or pick a track below to preview it here.</div>', unsafe_allow_html=True)
-
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # -------------------- RECOMMENDATIONS LIST --------------------
     st.markdown("<hr class='tf-divider'>", unsafe_allow_html=True)
 
     if st.session_state.recommendations:
@@ -1091,9 +1057,6 @@ with tab_discover:
     else:
         st.markdown('<div class="tf-empty-state"><span class="tf-emoji">🧭</span>Your recommendations will appear here once you generate them above.</div>', unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------------
-# TAB 2: MY PLAYLIST VAULT
-# ---------------------------------------------------------------------------
 with tab_vault:
     vault = st.session_state.playlist_vault
 
@@ -1139,7 +1102,7 @@ with tab_vault:
             st.text_area("Markdown tracklist", value=playlist_to_markdown(), height=220, label_visibility="collapsed")
             st.markdown("<br>", unsafe_allow_html=True)
             confirm_clear = st.checkbox("Confirm: I want to clear my playlist")
-            if st.button("季度 Clear Playlist", use_container_width=True, disabled=not confirm_clear):
+            if st.button("🧹 Clear Playlist", use_container_width=True, disabled=not confirm_clear):
                 st.session_state.playlist_vault = []
                 st.toast("Playlist cleared. Fresh start! 🌱")
                 st.rerun()
@@ -1147,7 +1110,4 @@ with tab_vault:
             st.caption("Add tracks to your vault to unlock export options.")
         st.markdown('</div>', unsafe_allow_html=True)
 
-# ===========================================================================
-# 11. FOOTER
-# ===========================================================================
 st.markdown('<div style="text-align:center; padding: 1.5rem 0 0.5rem 0; color:#5C7A73; font-size:0.78rem;">Built with Streamlit &amp; Google Gemini · TrackFind © 2026</div>', unsafe_allow_html=True)
