@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 
 
 # ===========================================================================
-# 1. CONFIGURATION & CONSTANTS
+# 1. CONFIGURATION, CONSTANTS & GLOBAL VARIABLE PATTERNS
 # ===========================================================================
 
 APP_TITLE = "🎵 TrackFind — Your Personal AI Music Curator"
@@ -51,6 +51,44 @@ GEMINI_MODEL_FALLBACKS = [
 
 GEMINI_API_KEY_PLACEHOLDER = "YOUR_GEMINI_API_KEY_HERE"
 
+YOUTUBE_ID_PATTERNS = [
+    r"(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([A-Za-z0-9_-]{11})",
+]
+
+FLUFF_PATTERNS = [
+    r"\(\s*official\s*video\s*\)", r"\[\s*official\s*video\s*\]",
+    r"\(\s*official\s*audio\s*\)", r"\[\s*official\s*audio\s*\]",
+    r"\(\s*official\s*music\s*video\s*\)", r"\[\s*official\s*music\s*video\s*\]",
+    r"\(\s*official\s*lyric\s*video\s*\)", r"\[\s*official\s*lyric\s*video\s*\]",
+    r"\(\s*lyrics?\s*\)", r"\[\s*lyrics?\s*\]",
+    r"\(\s*lyric\s*video\s*\)", r"\[\s*lyric\s*video\s*\]",
+    r"\(\s*audio\s*\)", r"\[\s*audio\s*\]",
+    r"\(\s*visualizer\s*\)", r"\[\s*visualizer\s*\]",
+    r"\(\s*hd\s*\)", r"\[\s*hd\s*\]", r"\(\s*4k\s*\)", r"\[\s*4k\s*\]", r"\(\s*hq\s*\)", r"\[\s*hq\s*\]",
+    r"\(\s*full\s*video\s*\)", r"\[\s*full\s*video\s*\]",
+    r"\(\s*full\s*song\s*\)", r"\[\s*full\s*song\s*\]",
+    r"\bofficial\s*video\b", r"\bofficial\s*audio\b",
+    r"\bofficial\s*music\s*video\b", r"\bofficial\s*lyric\s*video\b",
+    r"\bmusic\s*video\b", r"\blyric\s*video\b", r"\blyrics\b",
+    r"\bvisualizer\b", r"\b4k\b", r"\bhd\b", r"\bhq\b", r"\bfull\s*video\b",
+    r"\bremastered\b", r"\bclean\s*version\b", r"\bexplicit\s*version\b",
+    r"\(\s*explicit\s*\)", r"\[\s*explicit\s*\]",
+]
+
+FLUFF_REGEX = re.compile("|".join(FLUFF_PATTERNS), flags=re.IGNORECASE)
+
+NOISE_SEGMENT_PATTERNS = [
+    r"^(latest|new|hit|top|best)?\s*(punjabi|hindi|bollywood|english|haryanvi)?\s*song(s)?\s*\d*$",
+    r"^official\s*(video|audio)?$",
+]
+NOISE_SEGMENT_REGEX = re.compile("|".join(NOISE_SEGMENT_PATTERNS), flags=re.IGNORECASE)
+
+YOUTUBE_API_KEY_PLACEHOLDER = "YOUR_YOUTUBE_API_KEY_HERE"
+
+
+# ===========================================================================
+# 2. DATA RESOLUTION METHODS
+# ===========================================================================
 
 def get_api_key() -> Optional[str]:
     try:
@@ -58,18 +96,12 @@ def get_api_key() -> Optional[str]:
             return st.secrets["GEMINI_API_KEY"]
     except Exception:
         pass
-
     env_key = os.environ.get("GEMINI_API_KEY")
     if env_key:
         return env_key
-
     if GEMINI_API_KEY_PLACEHOLDER and GEMINI_API_KEY_PLACEHOLDER != "YOUR_GEMINI_API_KEY_HERE":
         return GEMINI_API_KEY_PLACEHOLDER
-
     return None
-
-
-YOUTUBE_API_KEY_PLACEHOLDER = "YOUR_YOUTUBE_API_KEY_HERE"
 
 
 def get_youtube_api_key() -> Optional[str]:
@@ -78,19 +110,26 @@ def get_youtube_api_key() -> Optional[str]:
             return st.secrets["YOUTUBE_API_KEY"]
     except Exception:
         pass
-
     env_key = os.environ.get("YOUTUBE_API_KEY")
     if env_key:
         return env_key
-
     if YOUTUBE_API_KEY_PLACEHOLDER and YOUTUBE_API_KEY_PLACEHOLDER != "YOUR_YOUTUBE_API_KEY_HERE":
         return YOUTUBE_API_KEY_PLACEHOLDER
-
     return None
 
 
+def get_genai_client() -> Optional[genai.Client]:
+    api_key = get_api_key()
+    if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
+        return None
+    try:
+        return genai.Client(api_key=api_key)
+    except Exception:
+        return None
+
+
 # ===========================================================================
-# 2. PAGE CONFIG
+# 3. UI LAYOUT CONSTANTS & VISUALIZATION CONFIG
 # ===========================================================================
 
 st.set_page_config(
@@ -100,19 +139,11 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-
-# ===========================================================================
-# 3. CUSTOM CSS — DARK / NEON-EMERALD MUSIC THEME
-# ===========================================================================
-
 CUSTOM_CSS = """
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap');
 
-    html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif;
-    }
-
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header[data-testid="stHeader"] {background: transparent;}
@@ -121,7 +152,6 @@ CUSTOM_CSS = """
         background: radial-gradient(circle at 10% 0%, #132022 0%, #0b0f10 45%, #08090a 100%);
         color: #E6F1EE;
     }
-
     .tf-hero {
         padding: 2.1rem 2.4rem;
         border-radius: 22px;
@@ -131,14 +161,6 @@ CUSTOM_CSS = """
         margin-bottom: 1.6rem;
         position: relative;
         overflow: hidden;
-    }
-    .tf-hero::after {
-        content: "";
-        position: absolute;
-        top: -60px; right: -60px;
-        width: 220px; height: 220px;
-        background: radial-gradient(circle, rgba(16,185,129,0.35), transparent 70%);
-        filter: blur(10px);
     }
     .tf-hero h1 {
         font-family: 'Space Grotesk', sans-serif;
@@ -150,34 +172,23 @@ CUSTOM_CSS = """
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
     }
-    .tf-hero p {
-        margin: 0.45rem 0 0 0;
-        color: #9CB8B0;
-        font-size: 0.98rem;
-        font-weight: 400;
-    }
-
+    .tf-hero p { margin: 0.45rem 0 0 0; color: #9CB8B0; font-size: 0.98rem; }
     .tf-card {
         background: linear-gradient(155deg, rgba(255,255,255,0.035) 0%, rgba(255,255,255,0.012) 100%);
         border: 1px solid rgba(255,255,255,0.07);
         border-radius: 18px;
         padding: 1.4rem 1.5rem;
         margin-bottom: 1.1rem;
-        box-shadow: 0 4px 18px rgba(0,0,0,0.25);
     }
     .tf-card-title {
         font-family: 'Space Grotesk', sans-serif;
         font-weight: 600;
         color: #6EE7B7;
         margin-bottom: 0.65rem;
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
         text-transform: uppercase;
         letter-spacing: 0.04em;
         font-size: 0.82rem;
     }
-
     .tf-track {
         background: rgba(255,255,255,0.03);
         border: 1px solid rgba(255,255,255,0.06);
@@ -185,32 +196,10 @@ CUSTOM_CSS = """
         border-radius: 14px;
         padding: 0.95rem 1.15rem;
         margin-bottom: 0.65rem;
-        transition: all 0.15s ease;
     }
-    .tf-track:hover {
-        background: rgba(16,185,129,0.07);
-        border-left-color: #34D399;
-        transform: translateX(2px);
-    }
-    .tf-track-song {
-        font-weight: 700;
-        font-size: 1.02rem;
-        color: #F0FDF9;
-        margin: 0;
-    }
-    .tf-track-artist {
-        color: #6EE7B7;
-        font-weight: 500;
-        font-size: 0.86rem;
-        margin: 0.1rem 0 0.4rem 0;
-    }
-    .tf-track-reason {
-        color: #9CB8B0;
-        font-size: 0.84rem;
-        font-style: italic;
-        line-height: 1.35;
-        margin: 0;
-    }
+    .tf-track-song { font-weight: 700; font-size: 1.02rem; color: #F0FDF9; margin: 0; }
+    .tf-track-artist { color: #6EE7B7; font-weight: 500; font-size: 0.86rem; margin: 0.1rem 0 0.4rem 0; }
+    .tf-track-reason { color: #9CB8B0; font-size: 0.84rem; font-style: italic; margin: 0; }
     .tf-badge {
         display: inline-block;
         background: rgba(16,185,129,0.15);
@@ -218,26 +207,10 @@ CUSTOM_CSS = """
         border: 1px solid rgba(16,185,129,0.35);
         font-size: 0.68rem;
         font-weight: 700;
-        letter-spacing: 0.04em;
         padding: 0.15rem 0.55rem;
         border-radius: 999px;
         margin-bottom: 0.4rem;
-        text-transform: uppercase;
     }
-
-    .tf-vault-row {
-        background: rgba(255,255,255,0.025);
-        border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 12px;
-        padding: 0.7rem 1rem;
-        margin-bottom: 0.5rem;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    .tf-vault-row span.tf-vault-title { font-weight: 600; color: #F0FDF9; }
-    .tf-vault-row span.tf-vault-artist { color: #6EE7B7; font-size: 0.85rem; }
-
     .tf-candidate {
         background: rgba(255,255,255,0.03);
         border: 1px solid rgba(255,255,255,0.07);
@@ -247,184 +220,46 @@ CUSTOM_CSS = """
         display: flex;
         align-items: center;
         gap: 0.7rem;
-        transition: all 0.15s ease;
     }
-    .tf-candidate:hover {
-        border-color: rgba(16,185,129,0.4);
-        background: rgba(16,185,129,0.06);
-    }
-    .tf-candidate img {
-        border-radius: 8px;
-        width: 64px;
-        height: 48px;
-        object-fit: cover;
-        flex-shrink: 0;
-    }
-    .tf-candidate-title {
-        font-weight: 600;
-        font-size: 0.88rem;
-        color: #F0FDF9;
-        line-height: 1.25;
-        margin: 0;
-    }
-    .tf-candidate-channel {
-        font-size: 0.74rem;
-        color: #7E978F;
-        margin: 0.1rem 0 0 0;
-    }
+    .tf-candidate img { border-radius: 8px; width: 64px; height: 48px; object-fit: cover; }
+    .tf-candidate-title { font-weight: 600; font-size: 0.88rem; color: #F0FDF9; margin: 0; }
+    .tf-candidate-channel { font-size: 0.74rem; color: #7E978F; margin: 0; }
     .tf-confidence-pill {
         display: inline-block;
         font-size: 0.66rem;
         font-weight: 700;
-        letter-spacing: 0.03em;
         padding: 0.1rem 0.5rem;
         border-radius: 999px;
         text-transform: uppercase;
         margin-left: 0.4rem;
     }
-    .tf-confidence-high {
-        background: rgba(16,185,129,0.15);
-        color: #6EE7B7;
-        border: 1px solid rgba(16,185,129,0.35);
-    }
-    .tf-confidence-refined {
-        background: rgba(167,139,250,0.15);
-        color: #C4B5FD;
-        border: 1px solid rgba(167,139,250,0.35);
-    }
-
+    .tf-confidence-high { background: rgba(16,185,129,0.15); color: #6EE7B7; border: 1px solid rgba(16,185,129,0.35); }
+    .tf-confidence-refined { background: rgba(167,139,250,0.15); color: #C4B5FD; border: 1px solid rgba(167,139,250,0.35); }
+    
     .stButton > button {
         border-radius: 10px !important;
         border: 1px solid rgba(16,185,129,0.4) !important;
         background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(16,185,129,0.06)) !important;
         color: #6EE7B7 !important;
         font-weight: 600 !important;
-        padding: 0.45rem 1rem !important;
-        transition: all 0.15s ease !important;
-        box-shadow: none !important;
     }
     .stButton > button:hover {
         background: linear-gradient(135deg, #10B981, #059669) !important;
         color: #06120D !important;
-        border-color: #34D399 !important;
-        box-shadow: 0 0 18px rgba(16,185,129,0.35) !important;
     }
-    .stButton > button:active { transform: scale(0.98); }
-
-    div[data-testid="stFormSubmitButton"] button {
-        background: linear-gradient(135deg, #10B981, #047857) !important;
-        color: #06120D !important;
-        border: none !important;
-        font-weight: 700 !important;
-        width: 100%;
-    }
-
     .tf-primary-btn .stButton > button {
         background: linear-gradient(135deg, #10B981, #059669) !important;
         color: #06120D !important;
         font-weight: 700 !important;
-        font-size: 1rem !important;
-        padding: 0.7rem 1.2rem !important;
-        width: 100%;
-        border: none !important;
-        box-shadow: 0 0 24px rgba(16,185,129,0.3) !important;
     }
-
     .tf-search-btn .stButton > button {
-        background: linear-gradient(135deg, rgba(110,231,183,0.16), rgba(16,185,129,0.05)) !important;
+        background: rgba(110,231,183,0.1) !important;
         color: #6EE7B7 !important;
-        font-weight: 700 !important;
-        width: 100%;
         border: 1px dashed rgba(110,231,183,0.45) !important;
     }
-    .tf-search-btn .stButton > button:hover {
-        border-style: solid !important;
-    }
-
-    .stTextInput input, .stTextArea textarea {
-        background: rgba(255,255,255,0.04) !important;
-        border: 1px solid rgba(255,255,255,0.1) !important;
-        border-radius: 10px !important;
-        color: #F0FDF9 !important;
-    }
-    .stTextInput input:focus, .stTextArea textarea:focus {
-        border-color: #10B981 !important;
-        box-shadow: 0 0 0 1px rgba(16,185,129,0.4) !important;
-    }
-
-    div[data-testid="stSlider"] [role="slider"] {
-        background-color: #10B981 !important;
-        box-shadow: 0 0 10px rgba(16,185,129,0.6) !important;
-    }
-    div[data-testid="stSlider"] > div > div > div > div {
-        background: linear-gradient(90deg, #047857, #10B981) !important;
-    }
-
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 6px;
-        background: rgba(255,255,255,0.02);
-        padding: 6px;
-        border-radius: 14px;
-        border: 1px solid rgba(255,255,255,0.06);
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 44px;
-        border-radius: 10px;
-        color: #9CB8B0;
-        font-weight: 600;
-        font-size: 0.92rem;
-    }
-    .stTabs [aria-selected="true"] {
-        background: linear-gradient(135deg, rgba(16,185,129,0.22), rgba(16,185,129,0.08)) !important;
-        color: #6EE7B7 !important;
-        border: 1px solid rgba(16,185,129,0.3);
-    }
-
-    div[role="radiogroup"] label {
-        background: rgba(255,255,255,0.03);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 10px;
-        padding: 0.4rem 0.9rem;
-        margin-right: 0.4rem;
-    }
-
-    .tf-subtle { color: #7E978F; font-size: 0.82rem; }
-    .tf-divider {
-        border: none;
-        border-top: 1px solid rgba(255,255,255,0.08);
-        margin: 1.1rem 0;
-    }
-    .tf-empty-state {
-        text-align: center;
-        padding: 2.4rem 1rem;
-        color: #6B8580;
-    }
-    .tf-empty-state .tf-emoji { font-size: 2.4rem; display: block; margin-bottom: 0.6rem; }
-
-    .tf-stat-chip {
-        display: inline-block;
-        background: rgba(16,185,129,0.1);
-        border: 1px solid rgba(16,185,129,0.3);
-        border-radius: 10px;
-        padding: 0.5rem 1rem;
-        color: #6EE7B7;
-        font-weight: 700;
-        font-size: 1.1rem;
-        margin-right: 0.6rem;
-    }
-    .tf-stat-chip span { display: block; font-size: 0.68rem; color: #9CB8B0; font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; }
-
-    div[data-testid="stDownloadButton"] button {
-        background: linear-gradient(135deg, rgba(16,185,129,0.18), rgba(16,185,129,0.06)) !important;
-        color: #6EE7B7 !important;
-        border: 1px solid rgba(16,185,129,0.4) !important;
-        font-weight: 600 !important;
-        width: 100%;
-    }
-    div[data-testid="stDownloadButton"] button:hover {
-        background: linear-gradient(135deg, #10B981, #059669) !important;
-        color: #06120D !important;
-    }
+    .stTextInput input, .stTextArea textarea { background: rgba(255,255,255,0.04) !important; border: 1px solid rgba(255,255,255,0.1) !important; color: #F0FDF9 !important; }
+    .tf-stat-chip { display: inline-block; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); border-radius: 10px; padding: 0.5rem 1rem; color: #6EE7B7; font-weight: 700; }
+    .tf-stat-chip span { display: block; font-size: 0.68rem; color: #9CB8B0; }
 </style>
 """
 
@@ -432,7 +267,7 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 # ===========================================================================
-# 4. DATA MODELS
+# 4. DATA TYPES & VALIDATION STRUCTS
 # ===========================================================================
 
 class RecommendedTrack(BaseModel):
@@ -460,78 +295,26 @@ class SeedTrack:
 
 
 # ===========================================================================
-# 5. CORE HELPER CODES & UTILITIES (DEFINED FIRST FOR PYTHON PARSING)
+# 5. CORE PARSING & INVERSION HEURISTICS
 # ===========================================================================
 
-def get_genai_client() -> Optional[genai.Client]:
-    api_key = get_api_key()
-    if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
-        return None
+def extract_youtube_id(url: str) -> Optional[str]:
+    for pattern in YOUTUBE_ID_PATTERNS:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def fetch_youtube_title(video_id: str) -> Optional[str]:
     try:
-        return genai.Client(api_key=api_key)
+        import urllib.request
+        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        with urllib.request.urlopen(oembed_url, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("title")
     except Exception:
         return None
-
-
-def render_hero():
-    st.markdown(
-        f"""
-        <div class="tf-hero">
-            <h1>{APP_TITLE}</h1>
-            <p>Discover your next favorite track — powered by Gemini AI, styled for the way you actually listen.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# ===========================================================================
-# 6. YOUTUBE LINK PARSING / CLEANING LOGIC
-# ===========================================================================
-
-YOUTUBE_ID_PATTERNS = [
-    r"(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/shorts\/)([A-Za-z0-9_-]{11})",
-]
-
-FLUFF_PATTERNS = [
-    r"\(\s*official\s*video\s*\)", r"\[\s*official\s*video\s*\]",
-    r"\(\s*official\s*audio\s*\)", r"\[\s*official\s*audio\s*\]",
-    r"\(\s*official\s*music\s*video\s*\)", r"\[\s*official\s*music\s*video\s*\]",
-    r"\(\s*official\s*lyric\s*video\s*\)", r"\[\s*official\s*lyric\s*video\s*\]",
-    r"\(\s*lyrics?\s*\)", r"\[\s*lyrics?\s*\]",
-    r"\(\s*lyric\s*video\s*\)", r"\[\s*lyric\s*video\s*\]",
-    r"\(\s*audio\s*\)", r"\[\s*audio\s*\]",
-    r"\(\s*visualizer\s*\)", r"\[\s*visualizer\s*\]",
-    r"\(\s*hd\s*\)", r"\[\s*hd\s*\]", r"\(\s*4k\s*\)", r"\[\s*4k\s*\]", r"\(\s*hq\s*\)", r"\[\s*hq\s*\]",
-    r"\(\s*full\s*video\s*\)", r"\[\s*full\s*video\s*\]",
-    r"\(\s*full\s*song\s*\)", r"\[\s*full\s*song\s*\]",
-    r"\bofficial\s*video\b", r"\bofficial\s*audio\b",
-    r"\bofficial\s*music\s*video\b", r"\bofficial\s*lyric\s*video\b",
-    r"\bmusic\s*video\b", r"\blyric\s*video\b", r"\blyrics\b",
-    r"\bvisualizer\b", r"\b4k\b", r"\bhd\b", r"\bhq\b", r"\bfull\s*video\b",
-    r"\bremastered\b", r"\bclean\s*version\b", r"\bexplicit\s*version\b",
-    r"\(\s*explicit\s*\)", r"\[\s*explicit\s*\]",
-]
-
-FLUFF_REGEX = re.compile("|".join(FLUFF_PATTERNS), flags=re.IGNORECASE)
-NOISE_SEGMENT_PATTERNS = [
-    r"^(latest|new|hit|top|best)?\s*(punjabi|hindi|bollywood|english|haryanvi)?\s*song(s)?\s*\d*$",
-    r"^official\s*(video|audio)?$",
-]
-NOISE_SEGMENT_REGEX = re.compile("|".join(NOISE_SEGMENT_PATTERNS), flags=re.IGNORECASE)
-
-
-def clean_youtube_title(raw_title: str) -> str:
-    if not raw_title:
-        return ""
-    cleaned = FLUFF_REGEX.sub("", raw_title)
-    cleaned = re.sub(r"\(\s*\)", "", cleaned)
-    cleaned = re.sub(r"\[\s*\]", "", cleaned)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)
-    cleaned = re.sub(r"\s*[-|]\s*$", "", cleaned)
-    cleaned = re.sub(r"^\s*[-|]\s*", "", cleaned)
-    cleaned = cleaned.strip(" -|·•").strip()
-    return cleaned
 
 
 def _is_structurally_complex(cleaned_title: str) -> bool:
@@ -670,15 +453,15 @@ def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
 
 
 def build_music_search_query(typed_artist: str, typed_title: str) -> str:
-    typed_artist = (typed_artist or "").strip()
-    typed_title = (typed_title or "").strip()
+    artist_clean = (typed_artist or "").strip()
+    title_clean = (typed_title or "").strip()
 
-    if typed_artist and typed_title:
-        return f"{typed_artist} {typed_title} song"
-    if typed_artist and not typed_title:
-        return f"{typed_artist} official audio music song"
-    if typed_title and not typed_artist:
-        return f"{typed_title} official audio music song"
+    if artist_clean and title_clean:
+        return f"{artist_clean} {title_clean} song"
+    if artist_clean and not title_clean:
+        return f"{artist_clean} official audio music song"
+    if title_clean and not artist_clean:
+        return f"{title_clean} official audio music song"
     return ""
 
 
@@ -837,7 +620,7 @@ def playlist_to_markdown() -> str:
 
 
 # ===========================================================================
-# 10. APP INITIALIZATION & MAIN PAGE ROUTINES
+# 6. APP RENDERING INTERFACE & TABS
 # ===========================================================================
 
 render_hero()
@@ -986,8 +769,6 @@ with tab_discover:
                     st.session_state.has_generated = True
                     st.session_state.last_seed = {"artist": seed_artist, "title": seed_title}
                     st.session_state.now_playing = {"Song": seed_title, "Artist": seed_artist, "video_id": seed_video_id}
-                    model_used = st.session_state.get("working_model", GEMINI_MODEL)
-                    st.success(f"🎉 Generated {len(results)} recommendations based on '{seed_title or seed_artist}'!")
                     st.rerun()
                 except Exception as e:
                     st.error(f"⚠️ Error: {e}")
@@ -1087,7 +868,7 @@ with tab_vault:
                         st.toast("Switched preview — check the Discover tab. 🎧")
                 with r3:
                     if st.button("🗑️", key=f"vault_remove_{i}", help="Remove from vault"):
-                        remove_from_playlist(i)
+                        st.session_state.playlist_vault.pop(i)
                         st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
