@@ -656,7 +656,7 @@ def init_session_state():
         "_last_auto_generated_fingerprint": None,  # guards against re-triggering on every rerun
         "_last_restored_upload_id": None,  # guards against re-importing the same vault file every rerun
         "current_queue_index": None,    # [FEATURE] index into playlist_vault for Next/Previous — None when playback isn't sourced from the vault queue
-        "queue_paused": False,          # [FEATURE] Play/Pause toggle for the active queue track
+        "confirm_clear_pending": False,  # [UX] tracks the single-click-then-confirm flow for Clear Playlist
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1455,7 +1455,6 @@ def load_queue_track(index: int):
         return
     track = vault[index]
     st.session_state.current_queue_index = index
-    st.session_state.queue_paused = False
     st.session_state.now_playing = {
         "Song": track.get("Song", ""),
         "Artist": track.get("Artist", ""),
@@ -2024,30 +2023,12 @@ with tab_discover:
                             # re-search on every rerun of the script.
                             st.session_state.now_playing["video_id"] = resolved_id
 
-            is_paused = in_queue_mode and st.session_state.get("queue_paused", False)
-
-            if video_id and not is_paused:
+            if video_id:
                 # We have a real, confirmed YouTube video — this embeds and
                 # plays directly inline.
                 watch_url = build_youtube_watch_url(video_id)
                 st.video(watch_url, autoplay=True)
                 st.caption("🔊 Now playing.")
-            elif video_id and is_paused:
-                # [HONEST DESIGN NOTE] st.video() has no programmatic
-                # play/pause API for an embedded YouTube iframe — Streamlit
-                # can't reach into the player to pause it. Rather than fake
-                # a control that doesn't actually work, "paused" here means
-                # the player isn't loaded at all, with a clear prompt to
-                # resume — a truthful approximation instead of a broken one.
-                st.markdown(
-                    """
-                    <div class="tf-empty-state" style="padding:1.6rem 1rem;">
-                        <span class="tf-emoji">⏸️</span>
-                        Paused.
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
             else:
                 # No confirmed video and no YouTube key configured (or the
                 # search came up empty) — st.video() cannot play a
@@ -2071,16 +2052,16 @@ with tab_discover:
                 else:
                     st.caption("No matching video was found automatically — try the link above.")
 
-            # [FEATURE] Active Queue Controller — Previous / Play-Pause /
-            # Next, inline under the player. Only meaningfully active when
-            # the current track came from the vault queue (clicking ▶️ on a
-            # saved track, or navigating with these same controls); disabled
-            # entirely otherwise since there's no queue context to step
-            # through. Buttons also gray out at the absolute ends of the
-            # vault list so Next/Previous can't run past the boundaries.
+            # [FEATURE] Active Queue Controller — Previous / Next, inline
+            # under the player. Only meaningfully active when the current
+            # track came from the vault queue (clicking ▶️ on a saved track,
+            # or navigating with these same controls); disabled entirely
+            # otherwise since there's no queue context to step through.
+            # Buttons also gray out at the absolute ends of the vault list
+            # so Next/Previous can't run past the boundaries.
             st.markdown("<br>", unsafe_allow_html=True)
             vault_len = len(st.session_state.playlist_vault)
-            ctrl_prev, ctrl_playpause, ctrl_next = st.columns(3)
+            ctrl_prev, ctrl_next = st.columns(2)
             with ctrl_prev:
                 st.button(
                     "⏮️ Previous",
@@ -2089,11 +2070,6 @@ with tab_discover:
                     disabled=not in_queue_mode or queue_idx == 0,
                     on_click=queue_play_previous,
                 )
-            with ctrl_playpause:
-                pp_label = "▶️ Play" if (in_queue_mode and st.session_state.get("queue_paused")) else "⏸️ Pause"
-                if st.button(pp_label, key="player_playpause", use_container_width=True, disabled=not in_queue_mode):
-                    st.session_state.queue_paused = not st.session_state.get("queue_paused", False)
-                    st.rerun()
             with ctrl_next:
                 st.button(
                     "⏭️ Next",
@@ -2213,10 +2189,9 @@ with tab_vault:
     queue_idx = st.session_state.get("current_queue_index")
     if vault and queue_idx is not None and 0 <= queue_idx < len(vault):
         active_track = vault[queue_idx]
-        is_paused = st.session_state.get("queue_paused", False)
 
         st.markdown('<div class="tf-playback-bar">', unsafe_allow_html=True)
-        bar_info_col, bar_controls_col = st.columns([2, 1.4])
+        bar_info_col, bar_controls_col = st.columns([2, 1])
         with bar_info_col:
             st.markdown(
                 f"""
@@ -2229,15 +2204,10 @@ with tab_vault:
                 unsafe_allow_html=True,
             )
         with bar_controls_col:
-            bar_prev, bar_playpause, bar_next = st.columns(3)
+            bar_prev, bar_next = st.columns(2)
             with bar_prev:
                 if st.button("⏮️", key="bar_prev", help="Previous track", use_container_width=True, disabled=(queue_idx == 0)):
                     queue_play_previous()
-                    st.rerun()
-            with bar_playpause:
-                pp_label = "▶️" if is_paused else "⏸️"
-                if st.button(pp_label, key="bar_playpause", help="Play / Pause", use_container_width=True):
-                    st.session_state.queue_paused = not is_paused
                     st.rerun()
             with bar_next:
                 if st.button("⏭️", key="bar_next", help="Next track", use_container_width=True, disabled=(queue_idx == len(vault) - 1)):
@@ -2309,7 +2279,6 @@ with tab_vault:
     # -------------------- EXPORT TOOLS --------------------
     with col_export:
         st.markdown('<div class="tf-card">', unsafe_allow_html=True)
-        st.markdown('<div class="tf-card-title">📤 Export &amp; Manage</div>', unsafe_allow_html=True)
 
         if vault:
             csv_bytes = playlist_to_csv_bytes()
@@ -2320,10 +2289,8 @@ with tab_vault:
                 mime="text/csv",
                 use_container_width=True,
             )
-            st.caption("This CSV can also be re-uploaded later in the \"Save & Resume\" section below.")
 
             st.markdown("<br>", unsafe_allow_html=True)
-            st.caption("Copy-paste tracklist:")
             st.text_area(
                 "Markdown tracklist",
                 value=playlist_to_markdown(),
@@ -2332,11 +2299,27 @@ with tab_vault:
             )
 
             st.markdown("<br>", unsafe_allow_html=True)
-            confirm_clear = st.checkbox("Confirm: I want to clear my playlist")
-            if st.button("🧹 Clear Playlist", use_container_width=True, disabled=not confirm_clear):
-                st.session_state.playlist_vault = []
-                st.toast("Playlist cleared. Fresh start! 🌱")
-                st.rerun()
+            # [UX] Single button, ask-on-click instead of a checkbox +
+            # permanently-disabled button. First click arms a confirmation
+            # prompt; a second click on the confirm button actually clears.
+            # Clicking anything else cancels the pending confirmation.
+            if st.session_state.get("confirm_clear_pending"):
+                st.warning("Clear your entire playlist? This can't be undone.")
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    if st.button("✅ Yes, clear it", use_container_width=True, key="clear_playlist_confirm_yes"):
+                        st.session_state.playlist_vault = []
+                        st.session_state.confirm_clear_pending = False
+                        st.toast("Playlist cleared. Fresh start! 🌱")
+                        st.rerun()
+                with cc2:
+                    if st.button("Cancel", use_container_width=True, key="clear_playlist_confirm_no"):
+                        st.session_state.confirm_clear_pending = False
+                        st.rerun()
+            else:
+                if st.button("🧹 Clear Playlist", use_container_width=True, key="clear_playlist_btn"):
+                    st.session_state.confirm_clear_pending = True
+                    st.rerun()
         else:
             st.caption("Add tracks to your vault to unlock export options.")
 
