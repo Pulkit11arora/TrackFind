@@ -78,8 +78,6 @@ QA / PM CHANGELOG (this revision):
 
 import os
 import re
-import csv
-import io
 import json
 import time
 from dataclasses import dataclass, field, asdict
@@ -1515,81 +1513,14 @@ def move_track_in_vault(index: int, direction: int):
                 break
 
 
-def _parse_csv_tracks(text: str) -> Optional[List[dict]]:
-    """
-    Parses a CSV file into track dicts, tolerant of both TrackFind's own
-    exported format (Song, Artist, Reason, YouTube Link) and a minimal
-    user-edited CSV that only has Song/Artist columns. Column names are
-    matched case-insensitively. Returns None if the file doesn't look like
-    a track list at all (no recognizable Song/Artist columns).
-    """
-    try:
-        reader = csv.DictReader(io.StringIO(text))
-    except Exception:
-        return None
-
-    if not reader.fieldnames:
-        return None
-
-    normalized = {f.strip().lower(): f for f in reader.fieldnames if f}
-    song_key = normalized.get("song")
-    artist_key = normalized.get("artist")
-    if not song_key or not artist_key:
-        return None
-
-    reason_key = normalized.get("reason")
-    link_key = normalized.get("youtube link") or normalized.get("youtube_url") or normalized.get("link")
-
-    tracks = []
-    for row in reader:
-        song = (row.get(song_key) or "").strip()
-        artist = (row.get(artist_key) or "").strip()
-        if not song:
-            continue
-        track = {
-            "Song": song,
-            "Artist": artist,
-            "Reason": (row.get(reason_key) or "").strip() if reason_key else "",
-        }
-        link = (row.get(link_key) or "").strip() if link_key else ""
-        if link:
-            track["youtube_url"] = link
-        tracks.append(track)
-    return tracks
-
-
-def playlist_to_csv_bytes() -> bytes:
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Song", "Artist", "Reason", "YouTube Link"])
-    for track in st.session_state.playlist_vault:
-        writer.writerow([
-            track.get("Song", ""),
-            track.get("Artist", ""),
-            track.get("Reason", ""),
-            track.get("youtube_url", ""),
-        ])
-    return output.getvalue().encode("utf-8")
-
-
-def playlist_to_markdown() -> str:
-    if not st.session_state.playlist_vault:
-        return "_Your playlist vault is empty._"
-    lines = ["# 🎵 My TrackFind Playlist", ""]
-    for i, track in enumerate(st.session_state.playlist_vault, start=1):
-        link = track.get("youtube_url", "")
-        line = f"{i}. **{track.get('Song','')}** — {track.get('Artist','')}"
-        if link:
-            line += f" — [Listen]({link})"
-        lines.append(line)
-    return "\n".join(lines)
-
-
 def playlist_to_json_bytes() -> bytes:
     """
-    [FEATURE] Full-fidelity export (song, artist, reason, YouTube link) as
-    JSON — this is what powers "resume later" without requiring an account.
-    A returning user just re-uploads this file to restore their vault.
+    Full-fidelity export of the playlist vault as JSON — every field saved
+    per track (Song, Artist, Reason — the mood/match explanation Gemini
+    gave when recommending it — video_id, and youtube_url) comes along
+    automatically since this is a direct dump of the stored track dicts.
+    This is what powers "resume later" without requiring an account: a
+    returning user just re-uploads this file to restore their playlist.
     """
     payload = {
         "trackfind_export_version": 1,
@@ -1600,42 +1531,19 @@ def playlist_to_json_bytes() -> bytes:
 
 def restore_playlist_from_file(uploaded_bytes: bytes, filename: str = "") -> tuple[bool, str]:
     """
-    [BUG FIX] Previously, the app offered a "Download CSV" button but the
-    resume uploader only accepted .json — so a user who downloaded the CSV
-    (the more prominent of the two export buttons) had no way to bring it
-    back in. This now accepts EITHER format: JSON (TrackFind's own
-    full-fidelity export) or CSV (TrackFind's export, or even a minimal
-    user-edited Song/Artist CSV), auto-detecting which one was uploaded.
-
-    Merges with, rather than replaces, anything already in the vault —
-    duplicates by Song+Artist are skipped. Returns (success, message).
+    Parses a previously-downloaded playlist file and restores it into the
+    current session's vault — merging with, not replacing, anything
+    already saved (duplicates by Song+Artist are skipped). Returns
+    (success, message).
     """
-    text = None
     try:
-        text = uploaded_bytes.decode("utf-8")
+        data = json.loads(uploaded_bytes.decode("utf-8"))
     except Exception:
-        pass
+        return False, "That file couldn't be read — try downloading a fresh copy of your playlist and uploading that."
 
-    tracks = None
-    looks_like_json = filename.lower().endswith(".json") or (text and text.strip().startswith("{"))
-
-    if looks_like_json:
-        try:
-            data = json.loads(text)
-            candidate = data.get("playlist_vault")
-            if isinstance(candidate, list):
-                tracks = candidate
-        except Exception:
-            tracks = None
-
-    if tracks is None and text is not None:
-        # Either it wasn't JSON, or the JSON didn't have the expected shape
-        # — try CSV next regardless of the looks_like_json guess, since a
-        # misnamed file should still work if its actual content parses.
-        tracks = _parse_csv_tracks(text)
-
-    if tracks is None:
-        return False, "That doesn't look like a TrackFind playlist file (expected a .csv or .json export)."
+    tracks = data.get("playlist_vault")
+    if not isinstance(tracks, list):
+        return False, "That file doesn't contain a recognizable playlist."
 
     existing = {(t.get("Song", "").lower(), t.get("Artist", "").lower()) for t in st.session_state.playlist_vault}
     added = 0
@@ -2276,28 +2184,41 @@ with tab_vault:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # -------------------- EXPORT TOOLS --------------------
+    # -------------------- PLAYLIST DOWNLOAD, RESUME & MANAGE --------------------
     with col_export:
         st.markdown('<div class="tf-card">', unsafe_allow_html=True)
+        st.markdown('<div class="tf-card-title">💾 Save &amp; Resume Later</div>', unsafe_allow_html=True)
+        st.caption("No account needed — download your playlist now, and upload it next time to pick up right where you left off.")
 
         if vault:
-            csv_bytes = playlist_to_csv_bytes()
+            json_bytes = playlist_to_json_bytes()
             st.download_button(
-                label="⬇️ Download CSV",
-                data=csv_bytes,
-                file_name="trackfind_playlist.csv",
-                mime="text/csv",
+                label="⬇️ Download Playlist",
+                data=json_bytes,
+                file_name="trackfind_playlist.json",
+                mime="application/json",
                 use_container_width=True,
             )
-
             st.markdown("<br>", unsafe_allow_html=True)
-            st.text_area(
-                "Markdown tracklist",
-                value=playlist_to_markdown(),
-                height=220,
-                label_visibility="collapsed",
-            )
 
+        uploaded_vault = st.file_uploader(
+            "Resume a saved playlist",
+            label_visibility="collapsed",
+            key="vault_resume_uploader",
+        )
+        if uploaded_vault is not None:
+            already_processed = st.session_state.get("_last_restored_upload_id")
+            upload_id = f"{uploaded_vault.name}_{uploaded_vault.size}"
+            if already_processed != upload_id:
+                success, message = restore_playlist_from_file(uploaded_vault.read(), uploaded_vault.name)
+                st.session_state["_last_restored_upload_id"] = upload_id
+                if success:
+                    st.success(f"✅ {message}")
+                    st.rerun()
+                else:
+                    st.error(f"⚠️ {message}")
+
+        if vault:
             st.markdown("<br>", unsafe_allow_html=True)
             # [UX] Single button, ask-on-click instead of a checkbox +
             # permanently-disabled button. First click arms a confirmation
@@ -2320,44 +2241,8 @@ with tab_vault:
                 if st.button("🧹 Clear Playlist", use_container_width=True, key="clear_playlist_btn"):
                     st.session_state.confirm_clear_pending = True
                     st.rerun()
-        else:
-            st.caption("Add tracks to your vault to unlock export options.")
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # -------------------- SAVE & RESUME (no login required) --------------------
-        st.markdown('<div class="tf-card">', unsafe_allow_html=True)
-        st.markdown('<div class="tf-card-title">💾 Save &amp; Resume Later</div>', unsafe_allow_html=True)
-        st.caption("No account needed — download your vault now (CSV or the full-fidelity JSON), and upload either one next time to pick up right where you left off.")
-
-        if vault:
-            json_bytes = playlist_to_json_bytes()
-            st.download_button(
-                label="⬇️ Download My Vault (for next time)",
-                data=json_bytes,
-                file_name="trackfind_vault.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-            st.markdown("<br>", unsafe_allow_html=True)
-
-        uploaded_vault = st.file_uploader(
-            "Resume from a saved vault file",
-            type=["json", "csv"],
-            label_visibility="collapsed",
-            key="vault_resume_uploader",
-        )
-        if uploaded_vault is not None:
-            already_processed = st.session_state.get("_last_restored_upload_id")
-            upload_id = f"{uploaded_vault.name}_{uploaded_vault.size}"
-            if already_processed != upload_id:
-                success, message = restore_playlist_from_file(uploaded_vault.read(), uploaded_vault.name)
-                st.session_state["_last_restored_upload_id"] = upload_id
-                if success:
-                    st.success(f"✅ {message}")
-                    st.rerun()
-                else:
-                    st.error(f"⚠️ {message}")
+        elif not vault:
+            st.caption("Add tracks to your playlist to unlock download options.")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
