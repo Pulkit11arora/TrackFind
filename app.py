@@ -60,6 +60,20 @@ QA / PM CHANGELOG (this revision):
               artist-only), so YouTube search no longer surfaces unrelated
               talk-show clips, shorts, or OTT promo content instead of
               actual songs.
+    [FEATURE] "My Playlist Vault" is now an active media queue: a Playlist
+              Playback Bar above the tracklist shows the current
+              Previous/Play-Pause/Next position, and the same controls are
+              mirrored inline on the "Now Sampling" player. Next/Previous
+              correctly gray out at the absolute ends of the list. Note:
+              st.video() has no programmatic play/pause API for an embedded
+              YouTube iframe, so "Pause" honestly unloads the player with a
+              clear "Paused." state rather than faking a control that can't
+              actually reach into the iframe.
+    [FEATURE] Vault rows now have 🔼/🔽 reorder buttons (boundary-disabled
+              at the first/last row). Reordering tracks the currently
+              playing TRACK across the swap, not the numeric slot, so the
+              active queue position never desyncs from what's actually
+              loaded in the player.
 """
 
 import os
@@ -329,9 +343,48 @@ CUSTOM_CSS = """
         display: flex;
         justify-content: space-between;
         align-items: center;
+        transition: all 0.15s ease;
     }
     .tf-vault-row span.tf-vault-title { font-weight: 600; color: #F0FDF9; }
     .tf-vault-row span.tf-vault-artist { color: #6EE7B7; font-size: 0.85rem; }
+    .tf-vault-row-active {
+        background: rgba(16,185,129,0.1);
+        border: 1px solid rgba(16,185,129,0.4);
+        box-shadow: 0 0 16px rgba(16,185,129,0.15);
+    }
+
+    /* ---------- Playlist Playback Bar ---------- */
+    .tf-playback-bar {
+        background: linear-gradient(135deg, rgba(16,185,129,0.14) 0%, rgba(15,23,23,0.6) 70%);
+        border: 1px solid rgba(16,185,129,0.3);
+        border-radius: 16px;
+        padding: 1rem 1.3rem;
+        margin-bottom: 1.2rem;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        flex-wrap: wrap;
+    }
+    .tf-playback-bar-info { display: flex; flex-direction: column; min-width: 0; }
+    .tf-playback-bar-label {
+        font-size: 0.68rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        color: #6EE7B7;
+        margin-bottom: 0.15rem;
+    }
+    .tf-playback-bar-track {
+        font-weight: 700;
+        color: #F0FDF9;
+        font-size: 1rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 360px;
+    }
+    .tf-playback-bar-artist { color: #9CB8B0; font-size: 0.84rem; }
 
     /* ---------- Search-result candidate card (Feature 1) ---------- */
     .tf-candidate {
@@ -412,6 +465,13 @@ CUSTOM_CSS = """
         box-shadow: 0 0 18px rgba(16,185,129,0.35) !important;
     }
     .stButton > button:active { transform: scale(0.98); }
+    .stButton > button:disabled {
+        background: rgba(255,255,255,0.04) !important;
+        color: #6B8580 !important;
+        border: 1px solid rgba(255,255,255,0.08) !important;
+        box-shadow: none !important;
+        cursor: default !important;
+    }
 
     div[data-testid="stFormSubmitButton"] button {
         background: linear-gradient(135deg, #10B981, #047857) !important;
@@ -595,6 +655,8 @@ def init_session_state():
         "auto_generate_enabled": True,  # [UX FEATURE] auto-generate recommendations on seed confirm
         "_last_auto_generated_fingerprint": None,  # guards against re-triggering on every rerun
         "_last_restored_upload_id": None,  # guards against re-importing the same vault file every rerun
+        "current_queue_index": None,    # [FEATURE] index into playlist_vault for Next/Previous — None when playback isn't sourced from the vault queue
+        "queue_paused": False,          # [FEATURE] Play/Pause toggle for the active queue track
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1368,6 +1430,91 @@ def remove_from_playlist(index: int):
         removed = st.session_state.playlist_vault.pop(index)
         st.toast(f"Removed '{removed['Song']}' from your vault.", icon="🗑️")
 
+        # [BUG FIX] Keep the active queue index consistent after a deletion
+        # so Next/Previous don't silently point at the wrong track.
+        current_idx = st.session_state.get("current_queue_index")
+        if current_idx is not None:
+            if index == current_idx:
+                # The currently-playing track was removed — drop out of
+                # queue mode rather than guess which track should play next.
+                st.session_state.current_queue_index = None
+            elif index < current_idx:
+                # Everything after the removed slot shifts down by one.
+                st.session_state.current_queue_index = current_idx - 1
+
+
+def load_queue_track(index: int):
+    """
+    [FEATURE] Loads the vault track at `index` into the player and marks it
+    as the active queue position, so subsequent Next/Previous clicks know
+    where they are. Used by the vault's own "▶️ Play" buttons AND by the
+    Previous/Next controls under the player.
+    """
+    vault = st.session_state.playlist_vault
+    if not (0 <= index < len(vault)):
+        return
+    track = vault[index]
+    st.session_state.current_queue_index = index
+    st.session_state.queue_paused = False
+    st.session_state.now_playing = {
+        "Song": track.get("Song", ""),
+        "Artist": track.get("Artist", ""),
+        "video_id": track.get("video_id", ""),
+        "Reason": track.get("Reason", ""),
+    }
+
+
+def queue_play_next():
+    """[FEATURE] Advances the queue by one track, if not already at the end."""
+    idx = st.session_state.get("current_queue_index")
+    vault = st.session_state.playlist_vault
+    if idx is None or not vault:
+        return
+    if idx + 1 < len(vault):
+        load_queue_track(idx + 1)
+
+
+def queue_play_previous():
+    """[FEATURE] Steps the queue back by one track, if not already at the start."""
+    idx = st.session_state.get("current_queue_index")
+    vault = st.session_state.playlist_vault
+    if idx is None or not vault:
+        return
+    if idx - 1 >= 0:
+        load_queue_track(idx - 1)
+
+
+def move_track_in_vault(index: int, direction: int):
+    """
+    [FEATURE] Swaps the track at `index` with its neighbor at `index +
+    direction` (direction is -1 for "move up", +1 for "move down"). No-ops
+    safely if the swap would go out of bounds.
+
+    [BUG FIX] Keeps `current_queue_index` pointed at the SAME TRACK (not the
+    same numeric slot) across the swap — without this, reordering while a
+    track is actively playing would silently make Next/Previous jump to the
+    wrong song, since the integer index alone doesn't follow the track when
+    its position changes.
+    """
+    vault = st.session_state.playlist_vault
+    target = index + direction
+    if not (0 <= index < len(vault)) or not (0 <= target < len(vault)):
+        return
+
+    current_idx = st.session_state.get("current_queue_index")
+    playing_track_id = None
+    if current_idx is not None and 0 <= current_idx < len(vault):
+        t = vault[current_idx]
+        playing_track_id = (t.get("Song", "").lower(), t.get("Artist", "").lower())
+
+    vault[index], vault[target] = vault[target], vault[index]
+
+    if playing_track_id is not None:
+        for i, t in enumerate(vault):
+            if (t.get("Song", "").lower(), t.get("Artist", "").lower()) == playing_track_id:
+                st.session_state.current_queue_index = i
+                break
+
 
 def _parse_csv_tracks(text: str) -> Optional[List[dict]]:
     """
@@ -1638,7 +1785,9 @@ with tab_discover:
                         "title": confirmed_title,
                         "video_id": chosen["video_id"],
                     }
-                    # Instant playback the moment a track is confirmed.
+                    # Instant playback the moment a track is confirmed. This
+                    # isn't vault-queue playback, so step out of queue mode.
+                    st.session_state.current_queue_index = None
                     st.session_state.now_playing = {
                         "Song": confirmed_title,
                         "Artist": confirmed_artist,
@@ -1662,6 +1811,7 @@ with tab_discover:
                         "title": fb_title,
                         "video_id": "",
                     }
+                    st.session_state.current_queue_index = None
                     st.session_state.now_playing = {
                         "Song": fb_title,
                         "Artist": fb_artist,
@@ -1681,6 +1831,7 @@ with tab_discover:
                         "title": fb_title,
                         "video_id": "",
                     }
+                    st.session_state.current_queue_index = None
                     st.session_state.now_playing = {
                         "Song": fb_title,
                         "Artist": fb_artist,
@@ -1726,6 +1877,7 @@ with tab_discover:
                     # [BUG FIX 2] Update the player THE MOMENT we have a
                     # video_id — independent of clicking Generate.
                     if seed.video_id:
+                        st.session_state.current_queue_index = None
                         st.session_state.now_playing = {
                             "Song": seed.title,
                             "Artist": seed.artist,
@@ -1804,6 +1956,7 @@ with tab_discover:
                 st.session_state.recommendations = results
                 st.session_state.has_generated = True
                 st.session_state.last_seed = {"artist": artist, "title": title}
+                st.session_state.current_queue_index = None
                 st.session_state.now_playing = {
                     "Song": title,
                     "Artist": artist,
@@ -1842,6 +1995,8 @@ with tab_discover:
         st.markdown('<div class="tf-card-title">▶️ Now Sampling</div>', unsafe_allow_html=True)
 
         now_playing = st.session_state.now_playing
+        queue_idx = st.session_state.get("current_queue_index")
+        in_queue_mode = queue_idx is not None and 0 <= queue_idx < len(st.session_state.playlist_vault)
 
         if now_playing and (now_playing.get("Song") or now_playing.get("Artist")):
             song = now_playing.get("Song", "")
@@ -1869,12 +2024,30 @@ with tab_discover:
                             # re-search on every rerun of the script.
                             st.session_state.now_playing["video_id"] = resolved_id
 
-            if video_id:
+            is_paused = in_queue_mode and st.session_state.get("queue_paused", False)
+
+            if video_id and not is_paused:
                 # We have a real, confirmed YouTube video — this embeds and
                 # plays directly inline.
                 watch_url = build_youtube_watch_url(video_id)
-                st.video(watch_url)
+                st.video(watch_url, autoplay=True)
                 st.caption("🔊 Now playing.")
+            elif video_id and is_paused:
+                # [HONEST DESIGN NOTE] st.video() has no programmatic
+                # play/pause API for an embedded YouTube iframe — Streamlit
+                # can't reach into the player to pause it. Rather than fake
+                # a control that doesn't actually work, "paused" here means
+                # the player isn't loaded at all, with a clear prompt to
+                # resume — a truthful approximation instead of a broken one.
+                st.markdown(
+                    """
+                    <div class="tf-empty-state" style="padding:1.6rem 1rem;">
+                        <span class="tf-emoji">⏸️</span>
+                        Paused.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
             else:
                 # No confirmed video and no YouTube key configured (or the
                 # search came up empty) — st.video() cannot play a
@@ -1897,6 +2070,62 @@ with tab_discover:
                     st.caption("Tip: add a free YOUTUBE_API_KEY to enable automatic inline playback for every recommendation.")
                 else:
                     st.caption("No matching video was found automatically — try the link above.")
+
+            # [FEATURE] Active Queue Controller — Previous / Play-Pause /
+            # Next, inline under the player. Only meaningfully active when
+            # the current track came from the vault queue (clicking ▶️ on a
+            # saved track, or navigating with these same controls); disabled
+            # entirely otherwise since there's no queue context to step
+            # through. Buttons also gray out at the absolute ends of the
+            # vault list so Next/Previous can't run past the boundaries.
+            st.markdown("<br>", unsafe_allow_html=True)
+            vault_len = len(st.session_state.playlist_vault)
+            ctrl_prev, ctrl_playpause, ctrl_next = st.columns(3)
+            with ctrl_prev:
+                st.button(
+                    "⏮️ Previous",
+                    key="player_prev",
+                    use_container_width=True,
+                    disabled=not in_queue_mode or queue_idx == 0,
+                    on_click=queue_play_previous,
+                )
+            with ctrl_playpause:
+                pp_label = "▶️ Play" if (in_queue_mode and st.session_state.get("queue_paused")) else "⏸️ Pause"
+                if st.button(pp_label, key="player_playpause", use_container_width=True, disabled=not in_queue_mode):
+                    st.session_state.queue_paused = not st.session_state.get("queue_paused", False)
+                    st.rerun()
+            with ctrl_next:
+                st.button(
+                    "⏭️ Next",
+                    key="player_next",
+                    use_container_width=True,
+                    disabled=not in_queue_mode or queue_idx == vault_len - 1,
+                    on_click=queue_play_next,
+                )
+            if not in_queue_mode:
+                st.caption("Play a track from your Playlist Vault to enable queue controls.")
+
+            # [FEATURE] Save whatever's currently playing straight to the
+            # vault, without needing to find it again in the recommendations
+            # list below — handy for a track pasted/searched directly, or
+            # one you're sampling that you want to keep regardless of how
+            # it got here.
+            st.markdown("<br>", unsafe_allow_html=True)
+            already_saved = any(
+                t.get("Song", "").lower() == song.lower() and t.get("Artist", "").lower() == artist.lower()
+                for t in st.session_state.playlist_vault
+            )
+            if already_saved:
+                st.button("✅ Already in your Playlist", use_container_width=True, disabled=True, key="add_current_saved")
+            else:
+                if st.button("➕ Add to Playlist", use_container_width=True, key="add_current_to_playlist"):
+                    add_to_playlist({
+                        "Song": song,
+                        "Artist": artist,
+                        "Reason": now_playing.get("Reason", ""),
+                        "video_id": video_id,
+                    })
+                    st.rerun()
         else:
             st.markdown(
                 """
@@ -1938,6 +2167,7 @@ with tab_discover:
                     )
                 with c_play:
                     if st.button("▶️ Play", key=f"play_{idx}"):
+                        st.session_state.current_queue_index = None
                         st.session_state.now_playing = {"Song": song, "Artist": artist, "video_id": ""}
                         st.rerun()
                 with c_add:
@@ -1979,6 +2209,44 @@ with tab_vault:
 
     st.markdown("<hr class='tf-divider'>", unsafe_allow_html=True)
 
+    # -------------------- 🎧 PLAYLIST PLAYBACK BAR --------------------
+    queue_idx = st.session_state.get("current_queue_index")
+    if vault and queue_idx is not None and 0 <= queue_idx < len(vault):
+        active_track = vault[queue_idx]
+        is_paused = st.session_state.get("queue_paused", False)
+
+        st.markdown('<div class="tf-playback-bar">', unsafe_allow_html=True)
+        bar_info_col, bar_controls_col = st.columns([2, 1.4])
+        with bar_info_col:
+            st.markdown(
+                f"""
+                <div class="tf-playback-bar-info">
+                    <span class="tf-playback-bar-label">🎧 Now in Queue · Track {queue_idx + 1} of {len(vault)}</span>
+                    <span class="tf-playback-bar-track">{active_track.get('Song','')}</span>
+                    <span class="tf-playback-bar-artist">{active_track.get('Artist','')}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with bar_controls_col:
+            bar_prev, bar_playpause, bar_next = st.columns(3)
+            with bar_prev:
+                if st.button("⏮️", key="bar_prev", help="Previous track", use_container_width=True, disabled=(queue_idx == 0)):
+                    queue_play_previous()
+                    st.rerun()
+            with bar_playpause:
+                pp_label = "▶️" if is_paused else "⏸️"
+                if st.button(pp_label, key="bar_playpause", help="Play / Pause", use_container_width=True):
+                    st.session_state.queue_paused = not is_paused
+                    st.rerun()
+            with bar_next:
+                if st.button("⏭️", key="bar_next", help="Next track", use_container_width=True, disabled=(queue_idx == len(vault) - 1)):
+                    queue_play_next()
+                    st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+    elif vault:
+        st.caption("💡 Tip: click ▶️ on any saved track below to start your queue, then use the Previous/Next controls on the player.")
+
     col_list, col_export = st.columns([1.4, 1], gap="large")
 
     # -------------------- SAVED TRACKS LIST --------------------
@@ -1998,15 +2266,20 @@ with tab_vault:
             )
         else:
             for i, track in enumerate(vault):
-                r1, r2, r3 = st.columns([4.2, 0.9, 0.9])
+                is_current = st.session_state.get("current_queue_index") == i
+                r1, r2, r3, r4, r5 = st.columns([3.6, 0.7, 0.55, 0.55, 0.7])
                 with r1:
                     link = track.get("youtube_url", "")
                     link_html = f'<a href="{link}" target="_blank" style="color:#6EE7B7; font-size:0.78rem; text-decoration:none;">🔗 YouTube</a>' if link else ""
+                    now_playing_badge = (
+                        ' <span class="tf-badge" style="margin-bottom:0;">▶ Playing</span>' if is_current else ""
+                    )
+                    row_class = "tf-vault-row tf-vault-row-active" if is_current else "tf-vault-row"
                     st.markdown(
                         f"""
-                        <div class="tf-vault-row">
+                        <div class="{row_class}">
                             <div>
-                                <span class="tf-vault-title">{track.get('Song','')}</span><br>
+                                <span class="tf-vault-title">{track.get('Song','')}</span>{now_playing_badge}<br>
                                 <span class="tf-vault-artist">{track.get('Artist','')}</span> {link_html}
                             </div>
                         </div>
@@ -2014,14 +2287,19 @@ with tab_vault:
                         unsafe_allow_html=True,
                     )
                 with r2:
-                    if st.button("▶️", key=f"vault_play_{i}", help="Preview this track"):
-                        st.session_state.now_playing = {
-                            "Song": track.get("Song", ""),
-                            "Artist": track.get("Artist", ""),
-                            "video_id": track.get("video_id", ""),
-                        }
+                    if st.button("▶️", key=f"vault_play_{i}", help="Play this track"):
+                        load_queue_track(i)
                         st.toast("Switched preview — check the Discover tab. 🎧")
+                        st.rerun()
                 with r3:
+                    if st.button("🔼", key=f"vault_up_{i}", help="Move up", disabled=(i == 0)):
+                        move_track_in_vault(i, -1)
+                        st.rerun()
+                with r4:
+                    if st.button("🔽", key=f"vault_down_{i}", help="Move down", disabled=(i == len(vault) - 1)):
+                        move_track_in_vault(i, 1)
+                        st.rerun()
+                with r5:
                     if st.button("🗑️", key=f"vault_remove_{i}", help="Remove from vault"):
                         remove_from_playlist(i)
                         st.rerun()
