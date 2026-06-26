@@ -594,6 +594,7 @@ def init_session_state():
         "search_performed": False,      # persists across reruns (fixes a transient-button-state bug)
         "auto_generate_enabled": True,  # [UX FEATURE] auto-generate recommendations on seed confirm
         "_last_auto_generated_fingerprint": None,  # guards against re-triggering on every rerun
+        "_last_restored_upload_id": None,  # guards against re-importing the same vault file every rerun
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1338,6 +1339,24 @@ def add_to_playlist(track: dict):
     existing = {(t["Song"].lower(), t["Artist"].lower()) for t in st.session_state.playlist_vault}
     key = (track["Song"].lower(), track["Artist"].lower())
     if key not in existing:
+        # [FEATURE] Resolve a real YouTube link at save-time so exports can
+        # include a playable URL, not just text. Uses the official Data API
+        # (already cached) when a key is configured; falls back to a
+        # YouTube search URL otherwise so the field is never empty.
+        video_id = track.get("video_id", "")
+        if not video_id:
+            yt_key = get_youtube_api_key()
+            query = f"{track.get('Artist','')} {track.get('Song','')}".strip()
+            if yt_key and query:
+                video_id = search_youtube_video_id(query, yt_key) or ""
+
+        if video_id:
+            track["video_id"] = video_id
+            track["youtube_url"] = build_youtube_watch_url(video_id)
+        else:
+            query = f"{track.get('Artist','')} {track.get('Song','')}".strip()
+            track["youtube_url"] = build_youtube_search_url(query) if query else ""
+
         st.session_state.playlist_vault.append(track)
         st.toast(f"Added '{track['Song']}' to your Playlist Vault ✅", icon="🎶")
     else:
@@ -1353,9 +1372,14 @@ def remove_from_playlist(index: int):
 def playlist_to_csv_bytes() -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Song", "Artist", "Reason"])
+    writer.writerow(["Song", "Artist", "Reason", "YouTube Link"])
     for track in st.session_state.playlist_vault:
-        writer.writerow([track.get("Song", ""), track.get("Artist", ""), track.get("Reason", "")])
+        writer.writerow([
+            track.get("Song", ""),
+            track.get("Artist", ""),
+            track.get("Reason", ""),
+            track.get("youtube_url", ""),
+        ])
     return output.getvalue().encode("utf-8")
 
 
@@ -1364,8 +1388,56 @@ def playlist_to_markdown() -> str:
         return "_Your playlist vault is empty._"
     lines = ["# 🎵 My TrackFind Playlist", ""]
     for i, track in enumerate(st.session_state.playlist_vault, start=1):
-        lines.append(f"{i}. **{track.get('Song','')}** — {track.get('Artist','')}")
+        link = track.get("youtube_url", "")
+        line = f"{i}. **{track.get('Song','')}** — {track.get('Artist','')}"
+        if link:
+            line += f" — [Listen]({link})"
+        lines.append(line)
     return "\n".join(lines)
+
+
+def playlist_to_json_bytes() -> bytes:
+    """
+    [FEATURE] Full-fidelity export (song, artist, reason, YouTube link) as
+    JSON — this is what powers "resume later" without requiring an account.
+    A returning user just re-uploads this file to restore their vault.
+    """
+    payload = {
+        "trackfind_export_version": 1,
+        "playlist_vault": st.session_state.playlist_vault,
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def restore_playlist_from_json(uploaded_bytes: bytes) -> tuple[bool, str]:
+    """
+    Parses a previously-exported JSON file and restores it into the current
+    session's vault (merging with, not replacing, anything already saved —
+    duplicates by Song+Artist are skipped). Returns (success, message).
+    """
+    try:
+        data = json.loads(uploaded_bytes.decode("utf-8"))
+    except Exception:
+        return False, "That doesn't look like a valid TrackFind export file."
+
+    tracks = data.get("playlist_vault")
+    if not isinstance(tracks, list):
+        return False, "This file doesn't contain a recognizable playlist."
+
+    existing = {(t.get("Song", "").lower(), t.get("Artist", "").lower()) for t in st.session_state.playlist_vault}
+    added = 0
+    for track in tracks:
+        if not isinstance(track, dict) or not track.get("Song"):
+            continue
+        key = (track.get("Song", "").lower(), track.get("Artist", "").lower())
+        if key not in existing:
+            st.session_state.playlist_vault.append(track)
+            existing.add(key)
+            added += 1
+
+    if added == 0:
+        return True, "No new tracks to add — everything in that file is already in your vault."
+    return True, f"Restored {added} track{'s' if added != 1 else ''} into your vault."
 
 
 # ===========================================================================
@@ -1595,66 +1667,28 @@ with tab_discover:
 
                 parsed = st.session_state.get("_last_parsed_seed", {})
                 seed_video_id = parsed.get("video_id", "")
-                parse_confidence = parsed.get("parse_confidence", "high")
 
                 if parsed.get("title"):
-                    seed_artist_default = parsed.get("artist", "")
-                    seed_title_default = parsed.get("title", "")
+                    # Silently use the best-available parse. Any uncertainty
+                    # about the parse is an internal concern, not something
+                    # to surface to a listener who just wants to hear music —
+                    # the "Now Sampling" card below is the single source of
+                    # truth they see.
+                    seed_artist = parsed.get("artist", "")
+                    seed_title = parsed.get("title", "")
 
-                    # [BUG FIX] Previously, a "low" confidence regex guess
-                    # (ambiguous multi-segment title, no reliable signal)
-                    # displayed the SAME confident green badge as a clean
-                    # high-confidence match — giving false assurance on
-                    # exactly the titles most likely to be wrong (e.g.
-                    # complex regional uploads where the movie name and
-                    # song title can get swapped). Low confidence now gets
-                    # its own explicit warning badge instead.
-                    if parse_confidence == "refined":
-                        confidence_badge = '<span class="tf-confidence-pill tf-confidence-refined">✨ Gemini-refined</span>'
-                    elif parse_confidence == "low":
-                        confidence_badge = '<span class="tf-confidence-pill tf-confidence-low">⚠️ Uncertain — please verify</span>'
-                    else:
-                        confidence_badge = '<span class="tf-confidence-pill tf-confidence-high">Auto-detected</span>'
-
-                    st.markdown(
-                        f"✅ Detected: **{seed_title_default}** — *{seed_artist_default or 'Unknown artist'}* {confidence_badge}",
-                        unsafe_allow_html=True,
-                    )
-                    if not seed_artist_default:
-                        st.caption("Couldn't separate the artist automatically — feel free to refine below.")
-                    elif parse_confidence == "low":
-                        note = parsed.get("refine_note") or (
-                            "This title has a complex multi-part format (common on Bollywood/Punjabi "
-                            "uploads mixing singer, movie, and song name) and couldn't be parsed with full "
-                            "confidence — double-check the fields below before generating recommendations."
-                        )
-                        st.caption(f"⚠️ {note}")
-
-                    seed_artist = st.text_input(
-                        "Confirm / edit Artist",
-                        value=seed_artist_default,
-                        key=f"yt_artist_confirm_{seed_video_id}",
-                    )
-                    seed_title = st.text_input(
-                        "Confirm / edit Track Title",
-                        value=seed_title_default,
-                        key=f"yt_title_confirm_{seed_video_id}",
-                    )
-
-                    # If the user hand-edits the fields, keep the player in
-                    # sync with whatever is currently shown.
+                    # Keep the player in sync with whatever we just parsed.
                     if st.session_state.now_playing and st.session_state.now_playing.get("video_id") == seed_video_id:
                         st.session_state.now_playing["Song"] = seed_title
                         st.session_state.now_playing["Artist"] = seed_artist
 
                 elif seed_video_id:
-                    st.warning("⚠️ Found the video but couldn't auto-extract a clean title. Please enter details manually — the original video link will still be used for preview.")
-                    seed_artist = st.text_input("Artist Name (manual)", key="yt_artist_manual")
-                    seed_title = st.text_input("Track Title (manual)", key="yt_title_manual")
+                    seed_artist = st.text_input("Artist", key="yt_artist_manual", placeholder="e.g. The Weeknd")
+                    seed_title = st.text_input("Track Title", key="yt_title_manual", placeholder="e.g. Blinding Lights")
                 else:
-                    st.warning("⚠️ That doesn't look like a valid YouTube link. Please enter details manually.")
-                    seed_artist = st.text_input("Artist Name (manual)", key="yt_artist_manual")
-                    seed_title = st.text_input("Track Title (manual)", key="yt_title_manual")
+                    st.caption("That doesn't look like a valid YouTube link. Try pasting the full URL, or switch to Artist + Track.")
+                    seed_artist = st.text_input("Artist", key="yt_artist_manual", placeholder="e.g. The Weeknd")
+                    seed_title = st.text_input("Track Title", key="yt_title_manual", placeholder="e.g. Blinding Lights")
 
         st.markdown("<hr class='tf-divider'>", unsafe_allow_html=True)
 
@@ -1899,12 +1933,14 @@ with tab_vault:
             for i, track in enumerate(vault):
                 r1, r2, r3 = st.columns([4.2, 0.9, 0.9])
                 with r1:
+                    link = track.get("youtube_url", "")
+                    link_html = f'<a href="{link}" target="_blank" style="color:#6EE7B7; font-size:0.78rem; text-decoration:none;">🔗 YouTube</a>' if link else ""
                     st.markdown(
                         f"""
                         <div class="tf-vault-row">
                             <div>
                                 <span class="tf-vault-title">{track.get('Song','')}</span><br>
-                                <span class="tf-vault-artist">{track.get('Artist','')}</span>
+                                <span class="tf-vault-artist">{track.get('Artist','')}</span> {link_html}
                             </div>
                         </div>
                         """,
@@ -1915,7 +1951,7 @@ with tab_vault:
                         st.session_state.now_playing = {
                             "Song": track.get("Song", ""),
                             "Artist": track.get("Artist", ""),
-                            "video_id": "",
+                            "video_id": track.get("video_id", ""),
                         }
                         st.toast("Switched preview — check the Discover tab. 🎧")
                 with r3:
@@ -1957,6 +1993,42 @@ with tab_vault:
                 st.rerun()
         else:
             st.caption("Add tracks to your vault to unlock export options.")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # -------------------- SAVE & RESUME (no login required) --------------------
+        st.markdown('<div class="tf-card">', unsafe_allow_html=True)
+        st.markdown('<div class="tf-card-title">💾 Save &amp; Resume Later</div>', unsafe_allow_html=True)
+        st.caption("No account needed — download your vault now, and upload it next time to pick up right where you left off.")
+
+        if vault:
+            json_bytes = playlist_to_json_bytes()
+            st.download_button(
+                label="⬇️ Download My Vault (for next time)",
+                data=json_bytes,
+                file_name="trackfind_vault.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+
+        uploaded_vault = st.file_uploader(
+            "Resume from a saved vault file",
+            type=["json"],
+            label_visibility="collapsed",
+            key="vault_resume_uploader",
+        )
+        if uploaded_vault is not None:
+            already_processed = st.session_state.get("_last_restored_upload_id")
+            upload_id = f"{uploaded_vault.name}_{uploaded_vault.size}"
+            if already_processed != upload_id:
+                success, message = restore_playlist_from_json(uploaded_vault.read())
+                st.session_state["_last_restored_upload_id"] = upload_id
+                if success:
+                    st.success(f"✅ {message}")
+                    st.rerun()
+                else:
+                    st.error(f"⚠️ {message}")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
