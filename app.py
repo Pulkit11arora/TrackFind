@@ -33,13 +33,27 @@ QA / PM CHANGELOG (this revision):
               (multiple pipes/dashes, e.g. corporate Bollywood/Punjabi
               uploads) are flagged low-confidence and refined with a tiny
               Gemini call so Artist/Title no longer get scrambled.
-    [BUG FIX] refine_title_with_gemini's prompt now explicitly teaches the
-              model to (a) honor explicit "Song:"/"Movie:"/"Singer:"/"Track:"
-              labels when present, and (b) apply clear structural/positional
-              rules (title is usually the last segment, esp. after a dash;
-              a short standalone proper-noun middle segment is the movie/
-              album, never the title) — fixes cases where the movie name and
-              song title were getting inverted on complex regional uploads.
+    [BUG FIX] Fixed the actual root cause of artist/title inversion on
+              complex regional uploads: the Tier B regex heuristic and the
+              Gemini refinement prompt both previously assumed the song
+              title is always in a fixed position (e.g. "always last").
+              Real uploads use BOTH orderings interchangeably for the same
+              song (title-first AND title-last), so a position-only rule
+              silently picked the movie name instead of the title whenever
+              the order flipped. Both tiers now use a position-agnostic
+              signal instead: the comma-containing segment (e.g. "Jassi
+              Gill, Rubina Bajwa") is reliably the artist list wherever it
+              falls in the string, which correctly resolves both orderings
+              of "Fer Ohi Hoyea" / "Jassi Gill" / "Sargi".
+    [UX FIX]  Low-confidence parses (ambiguous 3+ segment titles where even
+              the improved heuristic is just a best-effort guess) now show
+              an explicit "⚠️ Uncertain — please verify" badge instead of
+              the same confident green badge as a clean match — a prior
+              revision silently displayed both with equal confidence, which
+              masked exactly the cases most likely to be wrong. A diagnostic
+              caption also explains WHY (no GEMINI_API_KEY configured vs.
+              Gemini was attempted but didn't resolve it) so users can tell
+              the difference between "not configured" and "genuinely hard".
     [UX FIX]  "🔍 Search Track" now appends music-context keywords to the
               query behind the scenes (e.g. "official audio music song")
               when the user provides a sparse query (single keyword or
@@ -374,6 +388,11 @@ CUSTOM_CSS = """
         color: #C4B5FD;
         border: 1px solid rgba(167,139,250,0.35);
     }
+    .tf-confidence-low {
+        background: rgba(245,158,11,0.15);
+        color: #FCD34D;
+        border: 1px solid rgba(245,158,11,0.35);
+    }
 
     /* ---------- Buttons ---------- */
     .stButton > button {
@@ -552,7 +571,8 @@ class SeedTrack:
     title: str = ""
     raw_source: str = ""   # original pasted YouTube URL, for display/debug
     video_id: str = ""     # real YouTube video ID, set only when known
-    parse_confidence: str = "high"  # "high" (simple regex) or "refined" (Gemini-assisted)
+    parse_confidence: str = "high"  # "high" (simple regex), "low" (ambiguous regex guess), or "refined" (Gemini-assisted)
+    refine_note: str = ""   # diagnostic: why Gemini refinement didn't happen/help, if applicable
 
 
 # ===========================================================================
@@ -572,6 +592,8 @@ def init_session_state():
         "last_search_query": "",        # actual augmented query sent to YouTube search
         "last_search_display_query": "",  # clean user-facing version (no injected keywords)
         "search_performed": False,      # persists across reruns (fixes a transient-button-state bug)
+        "auto_generate_enabled": True,  # [UX FEATURE] auto-generate recommendations on seed confirm
+        "_last_auto_generated_fingerprint": None,  # guards against re-triggering on every rerun
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -673,6 +695,92 @@ def fetch_youtube_title(video_id: str) -> Optional[str]:
         return None
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def fetch_youtube_description(video_id: str, api_key: str) -> Optional[str]:
+    """
+    [BUG FIX] oEmbed (used by fetch_youtube_title above) does NOT expose the
+    video description at all — only title/author/thumbnail. Many regional
+    uploads put the authoritative "Song: X / Movie: Y / Singer: Z" labels in
+    the DESCRIPTION, not the title, so without this the parser never even
+    sees that structured information.
+
+    This uses the official YouTube Data API v3 videos.list endpoint
+    (part=snippet), which DOES include the description, at a cost of just 1
+    quota unit per call (out of the free 10,000/day). Requires the optional
+    YOUTUBE_API_KEY — returns None gracefully if it's not configured or the
+    call fails for any reason, so callers always have the title-only path
+    as a fallback.
+    """
+    if not api_key or not video_id:
+        return None
+    try:
+        import urllib.request
+        import urllib.parse
+
+        params = {"part": "snippet", "id": video_id, "key": api_key}
+        url = "https://www.googleapis.com/youtube/v3/videos?" + urllib.parse.urlencode(params)
+        with urllib.request.urlopen(url, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        items = data.get("items", [])
+        if items:
+            return items[0].get("snippet", {}).get("description", "") or None
+        return None
+    except Exception:
+        return None
+
+
+# Matches "Song:", "Track:", "Singer:", "Artist:" style labels commonly
+# found in regional music video DESCRIPTIONS (not titles). Deliberately
+# conservative: only activates on cleanly-spaced text and caps value length,
+# since a wrong confident guess is worse than admitting uncertainty.
+_DESC_TARGET_LABELS = ["song", "track", "singer", "singers", "artist"]
+_DESC_LABEL_REGEX = re.compile(
+    r"\b(" + "|".join(_DESC_TARGET_LABELS) + r")\s*[:\-]\s*([^:\-\n]{1,50}?)(?=\s+\b[A-Za-z]+\s*[:\-]|\n|$)",
+    flags=re.IGNORECASE,
+)
+_DESC_GENRE_WORD = r"(punjabi|hindi|bollywood|english|haryanvi|movie|film)"
+
+# A lowercase letter immediately followed by an uppercase letter with no
+# space (e.g. "TalliMovie") signals the description has no real spacing
+# between credit-line fields. Our simple regex can't reliably parse that
+# format — when detected, skip regex entirely and defer to Gemini, which
+# has no trouble reading run-together text correctly.
+_RUN_TOGETHER_SIGNAL = re.compile(r"[a-z][A-Z]")
+
+
+def extract_labels_from_description(description: str) -> dict:
+    """
+    [BUG FIX] Fast, free, zero-API-call extraction of explicit "Song:" /
+    "Singer:" / "Artist:" / "Track:" labels from a video DESCRIPTION (not
+    title). When present and cleanly spaced (very common on official
+    Bollywood/Punjabi label uploads), this is authoritative and far more
+    reliable than any title-string heuristic — it's the uploader directly
+    telling us which field is which.
+
+    Returns a dict like {"song": "Ho Gaya Talli", "singer": "Diljit Dosanjh"}
+    with whichever labels were found. Returns an empty dict if no labels are
+    found OR if the text looks run-together with no real spacing (that case
+    is better handled by Gemini, which doesn't share this limitation).
+    """
+    if not description:
+        return {}
+
+    if _RUN_TOGETHER_SIGNAL.search(description):
+        return {}
+
+    found = {}
+    for match in _DESC_LABEL_REGEX.finditer(description):
+        label = match.group(1).strip().lower()
+        if label in ("singers", "artist"):
+            label = "singer"
+        value = match.group(2).strip().strip(".,;").strip()
+        value = re.sub(r"^" + _DESC_GENRE_WORD + r"\s+", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s+" + _DESC_GENRE_WORD + r"$", "", value, flags=re.IGNORECASE).strip()
+        if value and len(value.split()) <= 6 and label not in found:
+            found[label] = value
+    return found
+
+
 def clean_youtube_title(raw_title: str) -> str:
     """
     Strip common YouTube fluff like 'Official Video', 'HD', '4K', 'Lyrics',
@@ -739,20 +847,67 @@ def split_artist_title_regex(cleaned_title: str) -> SeedTrack:
         return SeedTrack(artist="", title=cleaned_title.strip(), parse_confidence="high")
 
     # TIER B fallback heuristic (used only if Gemini refinement is
-    # unavailable) — segment-based best guess, explicitly low-confidence.
+    # unavailable, or as a sanity check against it) — explicitly
+    # low-confidence, since 3+ segment titles are genuinely ambiguous.
+    #
+    # [BUG FIX] Earlier versions assumed a FIXED POSITION: "first segment is
+    # always the artist, last segment is always the title". That assumption
+    # is wrong about as often as it's right — regional uploads commonly use
+    # BOTH "Title - Artist | Movie | tag" AND "Artist | Movie | tag - Title"
+    # orderings interchangeably, so a position-only rule silently picks the
+    # movie name as the title whenever the order flips (e.g. "Sargi" picked
+    # instead of "Fer Ohi Hoyea").
+    #
+    # Instead, this uses a CONTENT-based signal that doesn't care about
+    # position: the segment containing a comma (e.g. "Jassi Gill, Rubina
+    # Bajwa" — primary singer + featured actor/actress) is reliably the
+    # artist list in this title format, regardless of where it falls in the
+    # string. The primary artist is the first name before the comma. Some
+    # uploads join co-stars with "&" instead of a comma (e.g. "Diljit
+    # Dosanjh & Sonam Bajwa") — treated the same way.
     segments = re.split(r"\s*\|\s*|\s+[-–—]\s+", cleaned_title)
     segments = [s.strip() for s in segments if s.strip()]
 
     if len(segments) <= 1:
         return SeedTrack(artist="", title=cleaned_title.strip(), parse_confidence="low")
 
+    if len(segments) == 2:
+        return SeedTrack(artist=segments[0].strip(), title=segments[1].strip(), parse_confidence="low")
+
     meaningful = [s for s in segments if not NOISE_SEGMENT_REGEX.match(s)]
     if not meaningful:
         meaningful = segments
 
-    title_guess = meaningful[-1].strip()
-    artist_segment = meaningful[0].strip()
-    artist_guess = artist_segment.split(",")[0].strip() if "," in artist_segment else artist_segment
+    multi_name_segments = [s for s in meaningful if "," in s or re.search(r"\s&\s", s)]
+
+    if multi_name_segments:
+        # The multi-name segment is the artist/cast list, wherever it falls.
+        artist_segment = multi_name_segments[0]
+        first_name = re.split(r",|\s&\s", artist_segment)[0].strip()
+        artist_guess = first_name
+        remaining = [s for s in meaningful if s != artist_segment]
+    else:
+        # No comma or "&" anywhere in the string — fall back to the
+        # original first-segment-is-artist assumption, since we have no
+        # better signal.
+        artist_guess = meaningful[0].strip()
+        remaining = meaningful[1:]
+
+    if not remaining:
+        return SeedTrack(artist=artist_guess, title="", parse_confidence="low")
+
+    if len(remaining) == 1:
+        return SeedTrack(artist=artist_guess, title=remaining[0].strip(), parse_confidence="low")
+
+    # 2+ candidates remain after removing the artist segment and pure noise
+    # (typically: the movie/album name AND the song title). Movie/album
+    # names in this title format are overwhelmingly a single short word
+    # (e.g. "Sargi", "Sufna"), while song titles are usually multi-word.
+    # Prefer a multi-word remaining segment as the title; only fall back to
+    # plain position (last remaining segment) if every candidate is a
+    # single word, since we then have no remaining signal to use.
+    multi_word = [s for s in remaining if len(s.split()) > 1]
+    title_guess = multi_word[0].strip() if multi_word else remaining[-1].strip()
 
     return SeedTrack(artist=artist_guess, title=title_guess, parse_confidence="low")
 
@@ -762,7 +917,7 @@ def split_artist_title(cleaned_title: str) -> SeedTrack:
     return split_artist_title_regex(cleaned_title)
 
 
-def refine_title_with_gemini(messy_title: str) -> Optional[ParsedTitle]:
+def refine_title_with_gemini(messy_title: str, description: Optional[str] = None) -> Optional[ParsedTitle]:
     """
     TIER C — micro Gemini call used ONLY when the regex split was flagged
     low-confidence (structurally complex titles like multi-pipe corporate
@@ -771,59 +926,92 @@ def refine_title_with_gemini(messy_title: str) -> Optional[ParsedTitle]:
     model-fallback chain and fails silently (returns None) so callers always
     have the regex guess as a safety net.
 
-    [BUG FIX] Earlier revisions used a loosely-worded prompt that could
-    invert the movie/album name and the song title on complex regional
-    (Bollywood/Punjabi-style) uploads — e.g. mistaking a short film name
-    like "Sargi" for the song title and the real title "Fer Ohi Hoyea" for
-    something else. This prompt now (1) prioritizes explicit "Song:"/
-    "Movie:"/"Singer:"/"Track:" labels when present, and (2) gives the model
-    concrete structural/positional heuristics for titles with no explicit
-    labels, plus a self-check step before answering.
+    [BUG FIX] An earlier revision assumed the song title is always the LAST
+    segment of the string. That is wrong about as often as it's right —
+    real-world regional uploads use BOTH orderings interchangeably:
+        "Jassi Gill, Rubina Bajwa | Sargi | Latest Punjabi Song — Fer Ohi Hoyea"
+        "Fer Ohi Hoyea - Jassi Gill, Rubina Bajwa | Sargi | Latest Punjabi Song"
+    are the SAME song, with the title in opposite positions. A fixed-position
+    rule silently mis-picks the movie name ("Sargi") as the title whenever
+    the order flips. This prompt now uses POSITION-AGNOSTIC reasoning
+    instead: the comma-containing segment (multiple names) is reliably the
+    artist list wherever it falls, and a short single-word segment is
+    reliably the movie/album name wherever IT falls — neither rule depends
+    on first/last position.
+
+    [BUG FIX] Also accepts the video DESCRIPTION when available. oEmbed
+    (used for the title) never exposes the description, so earlier
+    revisions never saw the explicit "Song:"/"Singer:" labels that many
+    regional uploads put there instead of in the title — this was the
+    actual root cause behind cases like "Ho Gaya Talli | Super Singh |
+    Diljit Dosanjh & Sonam Bajwa | Jatinder Shah" (no comma — co-stars
+    joined with "&" instead — so the title-only heuristic had no reliable
+    signal at all, while the description plainly states
+    "Song - Ho Gaya Talli Movie - Super Singh Singer - Diljit Dosanjh").
     """
     client = get_genai_client()
     if client is None:
         return None
 
+    description_block = (
+        f'\n\nVideo description (may contain explicit "Song:"/"Singer:" labels '
+        f'— if so, these are MORE reliable than guessing from the title alone):\n"{description.strip()[:800]}"'
+        if description else ""
+    )
+
     prompt = f"""
 You are a metadata extraction specialist for music video titles, especially
 Bollywood, Punjabi, and other South Asian regional film/music uploads where
-the singer, movie/film name, genre tag, and song title are often mixed
-together in inconsistent order with "|" or "-"/"—" as separators.
+the singer, movie/film name, genre tag, and song title are mixed together
+with "|" or "-"/"—" as separators, in NO CONSISTENT ORDER. The song title
+may appear FIRST, LAST, or in the middle of the string — do not assume a
+fixed position. Co-stars or featured names may be joined with a comma OR
+with "&" (e.g. "Diljit Dosanjh & Sonam Bajwa") — both indicate a multi-name
+list where the FIRST name is the one to prefer as primary artist if no
+clearer "Singer:" label is available.
 
-Raw title: "{messy_title}"
+Raw title: "{messy_title}"{description_block}
 
-STEP 1 — Check for explicit key-value labels first.
-If the text contains explicit indicators such as "Song:", "Track:",
+STEP 1 — Check for explicit key-value labels first, in BOTH the title and
+the description if provided.
+If either text contains explicit indicators such as "Song:", "Track:",
 "Singer:", "Artist:", "Movie:", or "Film:", these are AUTHORITATIVE — use the
 value following "Song:" or "Track:" as the title, and the value following
-"Singer:" or "Artist:" as the artist, regardless of where they appear in the
-string. Ignore the value following "Movie:" or "Film:" entirely — that is
-never the artist or the title.
+"Singer:" or "Artist:" as the artist, regardless of where they appear or
+which of the two texts they're found in. Ignore the value following
+"Movie:" or "Film:" entirely — that is never the artist or the title.
 
-STEP 2 — If there are no explicit labels, use structural reasoning instead:
-- The SONG TITLE is almost always the LAST segment in the string, especially
-  if it immediately follows a dash ("-", "–", or "—") near the end.
-- The PRIMARY SINGER/ARTIST is almost always the FIRST segment. If that
-  segment lists multiple names separated by a comma, the first name is
-  usually the singer and the remaining names are usually featured artists or
-  film actors — prefer the first name as the primary artist.
-- A SHORT middle segment that is just one or two words and reads like a
-  single proper noun (e.g. a short film/movie name) is almost always the
-  MOVIE or ALBUM name, NOT the song title — even though its brevity might
-  make it look like a plausible title. Movie/album names must never be
-  returned as either the artist or the title.
-- A segment containing generic filler like "Latest", "New", "Punjabi Song",
-  "Hindi Song", "Bollywood", "Official", "Full Video", "Full Song", or a
-  bare year is pure noise — discard it; it is never the artist or the title.
+STEP 2 — If there are no explicit labels anywhere, identify segments by
+CONTENT, not position (the title is typically several "|" or dash-separated
+segments):
+- Find the segment that lists MULTIPLE NAMES separated by a comma OR by "&"
+  (e.g. "Jassi Gill, Rubina Bajwa" or "Diljit Dosanjh & Sonam Bajwa"). This
+  is reliably the ARTIST/CAST segment, no matter where in the string it
+  falls. The FIRST name in that list is usually the primary singer; the
+  rest are featured/secondary names (co-stars, actors) to discard.
+- Find any segment that is generic filler — "Latest Punjabi Song", "Hindi
+  Song", "Bollywood", "Official", "Full Video", "Full Song", or a bare year.
+  Discard these entirely; they are never the artist or the title.
+- Among the segments that remain after removing the artist/cast segment and
+  the filler segments, the MOVIE/ALBUM name is typically a SHORT segment of
+  just one or two words that reads like a single proper noun (e.g. "Sargi",
+  "Super Singh"). Discard this too — it is never the artist or the title,
+  even though its brevity might make it look like a plausible title.
+- A segment that is a person's name but reads more like a music director,
+  composer, or lyricist (common trailing segment, e.g. "Jatinder Shah",
+  "B Praak") rather than the lead singer should be treated as a CREDIT, not
+  the primary artist, unless no better candidate exists.
+- Whatever segment is left after removing the artist/cast, the filler, and
+  the movie/album name IS the song title — regardless of whether it was the
+  first, last, or a middle segment in the original string.
 
 STEP 3 — Self-check before answering:
-- Is the artist you chose an actual person or group name? If it looks like a
-  movie/film/album name instead, you picked the wrong segment — go back and
-  find the real singer, usually the first segment.
-- Is the title you chose the actual song name? If it looks like a short
-  film/movie name or a generic genre/language tag instead, you picked the
-  wrong segment — go back and find the real song title, usually the last
-  segment, often right after a dash.
+- Is the artist you chose an actual singer/performer, not a movie/film name
+  and not a composer/music-director credit (unless that's truly the only
+  name available)? If not, you picked the wrong segment.
+- Is the title you chose the actual song name — not the movie/album name,
+  and not a generic genre/language tag? Double-check it isn't simply the
+  shortest remaining segment chosen by position rather than content.
 
 Return ONLY the primary singer/artist and the actual standalone song title.
 """.strip()
@@ -853,9 +1041,19 @@ Return ONLY the primary singer/artist and the actual standalone song title.
 
 def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
     """
-    Full pipeline: extract video ID -> fetch raw title -> clean fluff ->
-    split into artist/title (Tier A regex) -> if flagged low-confidence and
-    a Gemini client is available, refine with a micro-call (Tier C).
+    Full pipeline:
+      1. Extract video ID.
+      2. Fetch raw title (oEmbed, no key needed) -> clean fluff -> Tier A/B
+         regex split.
+      3. [BUG FIX] If a YOUTUBE_API_KEY is configured, ALSO fetch the video
+         DESCRIPTION (oEmbed never exposes this — only the Data API does).
+         Regional uploads frequently put authoritative "Song:"/"Singer:"
+         labels in the description rather than the title, which earlier
+         revisions never even looked at.
+      4. If the regex split is low-confidence: try the free description
+         label extractor first (instant, no API call); if that doesn't
+         resolve it, fall back to a Gemini micro-call given BOTH the title
+         and (if available) the description for maximum context.
     """
     video_id = extract_youtube_id(url)
     if not video_id:
@@ -870,12 +1068,38 @@ def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
     seed.raw_source = url
     seed.video_id = video_id
 
-    if seed.parse_confidence == "low" and allow_gemini_refine and get_api_key():
-        refined = refine_title_with_gemini(cleaned)
+    if seed.parse_confidence != "low":
+        return seed
+
+    # Low-confidence regex guess — try to do better.
+    yt_key = get_youtube_api_key()
+    description = fetch_youtube_description(video_id, yt_key) if yt_key else None
+
+    # FAST PATH: free, instant label extraction from the description, if
+    # it's cleanly formatted enough to trust.
+    if description:
+        labels = extract_labels_from_description(description)
+        if labels.get("song") and labels.get("singer"):
+            seed.artist = labels["singer"]
+            seed.title = labels["song"]
+            seed.parse_confidence = "refined"
+            return seed
+
+    # SLOW PATH: Gemini micro-call, given the title AND description (when
+    # available) for maximum context — Gemini handles run-together/messy
+    # description text far better than regex can.
+    if not allow_gemini_refine:
+        seed.refine_note = "Gemini refinement skipped for this call."
+    elif not get_api_key():
+        seed.refine_note = "Add a GEMINI_API_KEY to enable automatic refinement of complex titles like this one."
+    else:
+        refined = refine_title_with_gemini(cleaned, description=description)
         if refined and refined.artist and refined.title:
             seed.artist = refined.artist
             seed.title = refined.title
             seed.parse_confidence = "refined"
+        else:
+            seed.refine_note = "Gemini refinement was attempted but didn't return a confident result — please double-check the fields below."
 
     return seed
 
@@ -1377,20 +1601,45 @@ with tab_discover:
                     seed_artist_default = parsed.get("artist", "")
                     seed_title_default = parsed.get("title", "")
 
-                    confidence_badge = (
-                        '<span class="tf-confidence-pill tf-confidence-refined">✨ Gemini-refined</span>'
-                        if parse_confidence == "refined"
-                        else '<span class="tf-confidence-pill tf-confidence-high">Auto-detected</span>'
-                    )
+                    # [BUG FIX] Previously, a "low" confidence regex guess
+                    # (ambiguous multi-segment title, no reliable signal)
+                    # displayed the SAME confident green badge as a clean
+                    # high-confidence match — giving false assurance on
+                    # exactly the titles most likely to be wrong (e.g.
+                    # complex regional uploads where the movie name and
+                    # song title can get swapped). Low confidence now gets
+                    # its own explicit warning badge instead.
+                    if parse_confidence == "refined":
+                        confidence_badge = '<span class="tf-confidence-pill tf-confidence-refined">✨ Gemini-refined</span>'
+                    elif parse_confidence == "low":
+                        confidence_badge = '<span class="tf-confidence-pill tf-confidence-low">⚠️ Uncertain — please verify</span>'
+                    else:
+                        confidence_badge = '<span class="tf-confidence-pill tf-confidence-high">Auto-detected</span>'
+
                     st.markdown(
                         f"✅ Detected: **{seed_title_default}** — *{seed_artist_default or 'Unknown artist'}* {confidence_badge}",
                         unsafe_allow_html=True,
                     )
                     if not seed_artist_default:
                         st.caption("Couldn't separate the artist automatically — feel free to refine below.")
+                    elif parse_confidence == "low":
+                        note = parsed.get("refine_note") or (
+                            "This title has a complex multi-part format (common on Bollywood/Punjabi "
+                            "uploads mixing singer, movie, and song name) and couldn't be parsed with full "
+                            "confidence — double-check the fields below before generating recommendations."
+                        )
+                        st.caption(f"⚠️ {note}")
 
-                    seed_artist = st.text_input("Confirm / edit Artist", value=seed_artist_default, key="yt_artist_confirm")
-                    seed_title = st.text_input("Confirm / edit Track Title", value=seed_title_default, key="yt_title_confirm")
+                    seed_artist = st.text_input(
+                        "Confirm / edit Artist",
+                        value=seed_artist_default,
+                        key=f"yt_artist_confirm_{seed_video_id}",
+                    )
+                    seed_title = st.text_input(
+                        "Confirm / edit Track Title",
+                        value=seed_title_default,
+                        key=f"yt_title_confirm_{seed_video_id}",
+                    )
 
                     # If the user hand-edits the fields, keep the player in
                     # sync with whatever is currently shown.
@@ -1414,7 +1663,7 @@ with tab_discover:
             "How many recommendations do you want?",
             min_value=5,
             max_value=50,
-            value=10,
+            value=5,
             step=1,
             help="Scale from a quick 5-track sample to a full 50-track deep dive.",
         )
@@ -1424,36 +1673,67 @@ with tab_discover:
             unsafe_allow_html=True,
         )
 
+        st.session_state.auto_generate_enabled = st.checkbox(
+            "⚡ Auto-generate as soon as a track is detected or confirmed",
+            value=st.session_state.get("auto_generate_enabled", True),
+            help="When on, recommendations generate automatically — no need to click the button below. Turn off if you'd rather review or edit the artist/title first.",
+        )
+
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown('<div class="tf-primary-btn">', unsafe_allow_html=True)
-        generate_clicked = st.button("✨ Generate Recommendations", use_container_width=True)
+        button_label = "🔁 Regenerate Recommendations" if st.session_state.auto_generate_enabled else "✨ Generate Recommendations"
+        generate_clicked = st.button(button_label, use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('</div>', unsafe_allow_html=True)  # close tf-card
 
         # -------------------- GENERATE LOGIC --------------------
-        if generate_clicked:
-            if not seed_title and not seed_artist:
+        def run_generation(artist: str, title: str, count: int, video_id: str = ""):
+            """
+            Shared generation routine used by both the manual "✨ Generate
+            Recommendations" button AND the new auto-generate trigger, so
+            the two paths can't drift out of sync.
+            """
+            if not title and not artist:
                 st.error("Please provide at least a track title or artist name before generating recommendations.")
-            else:
-                try:
-                    with st.spinner(f"🎧 Curating {num_recs} tracks with Gemini AI..."):
-                        results = get_recommendations(seed_artist, seed_title, num_recs)
-                    st.session_state.recommendations = results
-                    st.session_state.has_generated = True
-                    st.session_state.last_seed = {"artist": seed_artist, "title": seed_title}
-                    st.session_state.now_playing = {
-                        "Song": seed_title,
-                        "Artist": seed_artist,
-                        "video_id": seed_video_id,
-                    }
-                    model_used = st.session_state.get("working_model", GEMINI_MODEL)
-                    st.success(f"🎉 Generated {len(results)} recommendations based on '{seed_title or seed_artist}'!")
-                    st.caption(f"Served by `{model_used}`")
-                except RuntimeError as e:
-                    st.error(f"⚠️ {e}")
-                except Exception as e:
-                    st.error(f"⚠️ Something went wrong while contacting Gemini: {e}")
+                return
+            try:
+                with st.spinner(f"🎧 Curating {count} tracks with Gemini AI..."):
+                    results = get_recommendations(artist, title, count)
+                st.session_state.recommendations = results
+                st.session_state.has_generated = True
+                st.session_state.last_seed = {"artist": artist, "title": title}
+                st.session_state.now_playing = {
+                    "Song": title,
+                    "Artist": artist,
+                    "video_id": video_id,
+                }
+                model_used = st.session_state.get("working_model", GEMINI_MODEL)
+                st.success(f"🎉 Generated {len(results)} recommendations based on '{title or artist}'!")
+                st.caption(f"Served by `{model_used}`")
+            except RuntimeError as e:
+                st.error(f"⚠️ {e}")
+            except Exception as e:
+                st.error(f"⚠️ Something went wrong while contacting Gemini: {e}")
+
+        # [UX FEATURE] Auto-generate the moment a seed is confirmed — either
+        # a YouTube link finishes parsing, or a Search & Verify candidate is
+        # confirmed — instead of requiring an extra manual button click.
+        # Guarded by a "fingerprint" of the current seed so it only fires
+        # ONCE per new seed, not on every unrelated rerun (e.g. dragging the
+        # slider, or editing the artist/title fields afterward).
+        current_seed_fingerprint = f"{seed_artist}|{seed_title}|{seed_video_id}"
+        should_auto_generate = (
+            (seed_artist or seed_title)
+            and current_seed_fingerprint != st.session_state.get("_last_auto_generated_fingerprint")
+            and st.session_state.get("auto_generate_enabled", True)
+        )
+
+        if should_auto_generate:
+            st.session_state["_last_auto_generated_fingerprint"] = current_seed_fingerprint
+            run_generation(seed_artist, seed_title, num_recs, seed_video_id)
+        elif generate_clicked:
+            run_generation(seed_artist, seed_title, num_recs, seed_video_id)
 
     # -------------------- RIGHT COLUMN: PLAYBACK PREVIEW --------------------
     with col_player:
