@@ -1,8 +1,9 @@
 """
-TrackFind — Your Personal AI Music Curator
-============================================
-A premium, dark-themed Streamlit music recommendation app powered by the
-Google Gen AI SDK (Gemini).
+TrackFind — Your Personal Music Discovery Workspace
+=====================================================
+A polished, single-page music discovery and queueing app, powered by the
+Google Gen AI SDK (Gemini) for recommendations and the YouTube Data API for
+playback and search verification.
 
 Run locally:
     pip install -r requirements.txt
@@ -14,66 +15,44 @@ Deploy on Streamlit Community Cloud:
     3. In the app's "Secrets" settings, add:
            GEMINI_API_KEY = "your-real-key-here"
 
-           # Optional — enables (a) automatic inline playback for every AI
-           # recommendation, and (b) the "🔍 Search Track" verification step
-           # under Artist + Track mode. Free tier: ~100 searches/day.
-           # Get one at https://console.cloud.google.com/
-           # (enable "YouTube Data API v3", then create an API key).
+           # Optional — enables (a) the Search Song verification step, and
+           # (b) automatic inline playback for every recommendation. Free
+           # tier: ~100 searches/day. Get one at
+           # https://console.cloud.google.com/ (enable "YouTube Data API
+           # v3", then create an API key).
            YOUTUBE_API_KEY = "your-youtube-key-here"
 
-QA / PM CHANGELOG (this revision):
-    [FEATURE] Artist + Track mode now has an explicit "🔍 Search Track"
-              confirmation step — matches are shown as selectable cards
-              before any recommendation is generated.
-    [BUG FIX] Pasting a YouTube link now updates the "Now Sampling" player
-              immediately on parse, instead of waiting for the user to click
-              "Generate Recommendations".
-    [BUG FIX] YouTube title parsing is now tiered: a fast regex pass handles
-              simple "Artist - Title" uploads; complex multi-segment titles
-              (multiple pipes/dashes, e.g. corporate Bollywood/Punjabi
-              uploads) are flagged low-confidence and refined with a tiny
-              Gemini call so Artist/Title no longer get scrambled.
-    [BUG FIX] Fixed the actual root cause of artist/title inversion on
-              complex regional uploads: the Tier B regex heuristic and the
-              Gemini refinement prompt both previously assumed the song
-              title is always in a fixed position (e.g. "always last").
-              Real uploads use BOTH orderings interchangeably for the same
-              song (title-first AND title-last), so a position-only rule
-              silently picked the movie name instead of the title whenever
-              the order flipped. Both tiers now use a position-agnostic
-              signal instead: the comma-containing segment (e.g. "Jassi
-              Gill, Rubina Bajwa") is reliably the artist list wherever it
-              falls in the string, which correctly resolves both orderings
-              of "Fer Ohi Hoyea" / "Jassi Gill" / "Sargi".
-    [UX FIX]  Low-confidence parses (ambiguous 3+ segment titles where even
-              the improved heuristic is just a best-effort guess) now show
-              an explicit "⚠️ Uncertain — please verify" badge instead of
-              the same confident green badge as a clean match — a prior
-              revision silently displayed both with equal confidence, which
-              masked exactly the cases most likely to be wrong. A diagnostic
-              caption also explains WHY (no GEMINI_API_KEY configured vs.
-              Gemini was attempted but didn't resolve it) so users can tell
-              the difference between "not configured" and "genuinely hard".
-    [UX FIX]  "🔍 Search Track" now appends music-context keywords to the
-              query behind the scenes (e.g. "official audio music song")
-              when the user provides a sparse query (single keyword or
-              artist-only), so YouTube search no longer surfaces unrelated
-              talk-show clips, shorts, or OTT promo content instead of
-              actual songs.
-    [FEATURE] "My Playlist Vault" is now an active media queue: a Playlist
-              Playback Bar above the tracklist shows the current
-              Previous/Play-Pause/Next position, and the same controls are
-              mirrored inline on the "Now Sampling" player. Next/Previous
-              correctly gray out at the absolute ends of the list. Note:
-              st.video() has no programmatic play/pause API for an embedded
-              YouTube iframe, so "Pause" honestly unloads the player with a
-              clear "Paused." state rather than faking a control that can't
-              actually reach into the iframe.
-    [FEATURE] Vault rows now have 🔼/🔽 reorder buttons (boundary-disabled
-              at the first/last row). Reordering tracks the currently
-              playing TRACK across the swap, not the numeric slot, so the
-              active queue position never desyncs from what's actually
-              loaded in the player.
+CHANGELOG (this revision — B2C streaming workspace overhaul):
+    [UX OVERHAUL] Removed st.tabs entirely. Single-page workspace using
+              st.columns([1.1, 1.4]): the player and queue ("Up Next") live
+              permanently on the left; discovery and the recommendation
+              feed live on the right. Collapses to a clean vertical stack
+              on narrow/mobile viewports automatically (Streamlit's default
+              column behavior below its mobile breakpoint).
+    [DATA MODEL] RecommendedTrack.Reason (a single free-text sentence) is
+              replaced by MatchingAttributes: List[str] — exactly 3 short
+              categorical tags (e.g. "Sonic Match", "Tempo Sync", "90s
+              Nostalgia"). Rendered as inline pill badges instead of a
+              sentence. Older saved/backed-up tracks that still have a
+              legacy "Reason" string are read gracefully (shown as a single
+              pill) rather than breaking on restore.
+    [COPY]    Renamed throughout: "Seed Track Input" -> "Discover", "Choose
+              input method" -> "Source", "Artist + Track" -> "Search Song",
+              "My Playlist Vault" -> "Up Next", "Save & Resume Later" ->
+              "Backup Session". Removed casual/developer-facing emoji and
+              jargon from labels, placeholders, and button copy throughout.
+    [UX]      Clear Playlist is now a single inline "armed" button: first
+              click changes its own label in place to a visually urgent
+              confirm state; a second click purges. Interacting with any
+              other widget disarms it automatically (this falls out of how
+              Streamlit's st.button() return value already works — no
+              extra plumbing needed).
+    [CARRIED FORWARD] Continuous queue indexing (Next/Previous, drag-free
+              reorder, index-follows-track-not-slot on reorder/delete),
+              tiered YouTube title parsing (regex -> description-label
+              extraction -> Gemini fallback), Gemini model fallback chain,
+              JSON backup/resume, and the full dark/emerald custom theme
+              all carry forward unchanged in behavior.
 """
 
 import os
@@ -97,7 +76,8 @@ from pydantic import BaseModel, Field
 # 1. CONFIGURATION & CONSTANTS
 # ===========================================================================
 
-APP_TITLE = "🎵 TrackFind — Your Personal AI Music Curator"
+APP_TITLE = "TrackFind"
+APP_TAGLINE = "Your next favorite track, found."
 
 # Google retires Gemini model IDs on a rolling basis — gemini-1.5-flash and
 # gemini-2.0-flash have both already been shut down (404 NOT_FOUND on any
@@ -116,7 +96,7 @@ GEMINI_MODEL_FALLBACKS = [
 ]
 
 # ---------------------------------------------------------------------------
-# 🔑 GEMINI API KEY — CONFIGURATION PLACEHOLDER
+# GEMINI API KEY — CONFIGURATION PLACEHOLDER
 # ---------------------------------------------------------------------------
 # TrackFind looks for your key in this priority order:
 #   1. Streamlit secrets   -> .streamlit/secrets.toml  ->  GEMINI_API_KEY = "..."
@@ -146,16 +126,16 @@ def get_api_key() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 🔑 YOUTUBE DATA API KEY — OPTIONAL CONFIGURATION PLACEHOLDER
+# YOUTUBE DATA API KEY — OPTIONAL CONFIGURATION PLACEHOLDER
 # ---------------------------------------------------------------------------
 # This key is OPTIONAL but unlocks two features:
-#   (a) The "🔍 Search Track" verification step in Artist + Track mode.
-#   (b) Automatic inline playback for AI-recommended tracks (not just pasted
+#   (a) The Search Song verification step.
+#   (b) Automatic inline playback for recommended tracks (not just pasted
 #       links), since Gemini only ever returns song names, never URLs.
 #
 # Without it, both features degrade gracefully: search becomes a manual
 # confirmation step instead of real candidates, and playback falls back to
-# a "Find & play on YouTube" link button.
+# an external "Find on YouTube" link.
 #
 # Get a free key in ~2 minutes:
 #   1. https://console.cloud.google.com/ -> create/select a project
@@ -196,16 +176,21 @@ def get_youtube_api_key() -> Optional[str]:
 # ===========================================================================
 
 st.set_page_config(
-    page_title="TrackFind | AI Music Curator",
-    page_icon="🎵",
+    page_title="TrackFind",
+    page_icon="🎧",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
 
 # ===========================================================================
-# 3. CUSTOM CSS — DARK / NEON-EMERALD MUSIC THEME
+# 3. CUSTOM CSS — DARK / NEON-EMERALD STREAMING THEME
 # ===========================================================================
+# Same token system (slate backdrops, emerald/neon accents) as before, with
+# new component styles for the single-page streaming layout: a compact
+# horizontal track row with a rounded-square thumbnail (replacing the
+# bulkier card style), inline matching-attribute pills, and the inline
+# armed Clear Playlist button.
 
 CUSTOM_CSS = """
 <style>
@@ -225,16 +210,21 @@ CUSTOM_CSS = """
         color: #E6F1EE;
     }
 
-    /* ---------- Hero Header ---------- */
+    /* ---------- Hero / Top Bar ---------- */
     .tf-hero {
-        padding: 2.1rem 2.4rem;
-        border-radius: 22px;
+        padding: 1.5rem 2rem;
+        border-radius: 20px;
         background: linear-gradient(135deg, rgba(16,185,129,0.16) 0%, rgba(15,23,23,0.65) 60%);
         border: 1px solid rgba(16,185,129,0.25);
         box-shadow: 0 8px 32px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.03);
-        margin-bottom: 1.6rem;
+        margin-bottom: 1.4rem;
         position: relative;
         overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 0.8rem;
     }
     .tf-hero::after {
         content: "";
@@ -244,9 +234,9 @@ CUSTOM_CSS = """
         background: radial-gradient(circle, rgba(16,185,129,0.35), transparent 70%);
         filter: blur(10px);
     }
-    .tf-hero h1 {
+    .tf-hero-title {
         font-family: 'Space Grotesk', sans-serif;
-        font-size: 2.1rem;
+        font-size: 1.7rem;
         font-weight: 700;
         margin: 0;
         letter-spacing: -0.5px;
@@ -254,10 +244,10 @@ CUSTOM_CSS = """
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
     }
-    .tf-hero p {
-        margin: 0.45rem 0 0 0;
+    .tf-hero-tagline {
+        margin: 0.2rem 0 0 0;
         color: #9CB8B0;
-        font-size: 0.98rem;
+        font-size: 0.92rem;
         font-weight: 400;
     }
 
@@ -266,7 +256,7 @@ CUSTOM_CSS = """
         background: linear-gradient(155deg, rgba(255,255,255,0.035) 0%, rgba(255,255,255,0.012) 100%);
         border: 1px solid rgba(255,255,255,0.07);
         border-radius: 18px;
-        padding: 1.4rem 1.5rem;
+        padding: 1.3rem 1.4rem;
         margin-bottom: 1.1rem;
         box-shadow: 0 4px 18px rgba(0,0,0,0.25);
     }
@@ -280,44 +270,50 @@ CUSTOM_CSS = """
         gap: 0.5rem;
         text-transform: uppercase;
         letter-spacing: 0.04em;
-        font-size: 0.82rem;
+        font-size: 0.78rem;
     }
 
-    /* ---------- Track Row Card ---------- */
-    .tf-track {
+    /* ---------- Recommendation Feed Row ---------- */
+    .tf-feed-row {
         background: rgba(255,255,255,0.03);
         border: 1px solid rgba(255,255,255,0.06);
         border-left: 3px solid #10B981;
         border-radius: 14px;
-        padding: 0.95rem 1.15rem;
-        margin-bottom: 0.65rem;
+        padding: 0.9rem 1.1rem;
+        margin-bottom: 0.6rem;
         transition: all 0.15s ease;
     }
-    .tf-track:hover {
+    .tf-feed-row:hover {
         background: rgba(16,185,129,0.07);
         border-left-color: #34D399;
         transform: translateX(2px);
     }
-    .tf-track-song {
+    .tf-feed-song {
         font-weight: 700;
-        font-size: 1.02rem;
+        font-size: 1rem;
         color: #F0FDF9;
         margin: 0;
     }
-    .tf-track-artist {
+    .tf-feed-artist {
         color: #6EE7B7;
         font-weight: 500;
-        font-size: 0.86rem;
-        margin: 0.1rem 0 0.4rem 0;
-    }
-    .tf-track-reason {
-        color: #9CB8B0;
         font-size: 0.84rem;
-        font-style: italic;
-        line-height: 1.35;
-        margin: 0;
+        margin: 0.1rem 0 0.55rem 0;
     }
-    .tf-badge {
+    .tf-pill-row { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+    .tf-attr-pill {
+        display: inline-block;
+        background: rgba(16,185,129,0.12);
+        color: #8FE6C4;
+        border: 1px solid rgba(16,185,129,0.3);
+        font-size: 0.68rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        padding: 0.2rem 0.65rem;
+        border-radius: 999px;
+        white-space: nowrap;
+    }
+    .tf-index-badge {
         display: inline-block;
         background: rgba(16,185,129,0.15);
         color: #6EE7B7;
@@ -331,60 +327,74 @@ CUSTOM_CSS = """
         text-transform: uppercase;
     }
 
-    /* ---------- Vault track row ---------- */
-    .tf-vault-row {
+    /* ---------- Compact Collection Row (Up Next) ---------- */
+    .tf-collection-row {
         background: rgba(255,255,255,0.025);
         border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 12px;
-        padding: 0.7rem 1rem;
-        margin-bottom: 0.5rem;
+        border-radius: 10px;
+        padding: 0.45rem 0.6rem;
+        margin-bottom: 0.4rem;
         display: flex;
-        justify-content: space-between;
         align-items: center;
+        gap: 0.65rem;
         transition: all 0.15s ease;
     }
-    .tf-vault-row span.tf-vault-title { font-weight: 600; color: #F0FDF9; }
-    .tf-vault-row span.tf-vault-artist { color: #6EE7B7; font-size: 0.85rem; }
-    .tf-vault-row-active {
+    .tf-collection-row-active {
         background: rgba(16,185,129,0.1);
         border: 1px solid rgba(16,185,129,0.4);
-        box-shadow: 0 0 16px rgba(16,185,129,0.15);
+        box-shadow: 0 0 14px rgba(16,185,129,0.15);
     }
-
-    /* ---------- Playlist Playback Bar ---------- */
-    .tf-playback-bar {
-        background: linear-gradient(135deg, rgba(16,185,129,0.14) 0%, rgba(15,23,23,0.6) 70%);
-        border: 1px solid rgba(16,185,129,0.3);
-        border-radius: 16px;
-        padding: 1rem 1.3rem;
-        margin-bottom: 1.2rem;
+    .tf-thumb {
+        width: 40px;
+        height: 40px;
+        border-radius: 8px;
+        object-fit: cover;
+        flex-shrink: 0;
+        background: linear-gradient(135deg, rgba(16,185,129,0.25), rgba(15,23,23,0.8));
+    }
+    .tf-thumb-placeholder {
+        width: 40px;
+        height: 40px;
+        border-radius: 8px;
+        flex-shrink: 0;
+        background: linear-gradient(135deg, rgba(16,185,129,0.25), rgba(15,23,23,0.8));
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        gap: 1rem;
-        flex-wrap: wrap;
-    }
-    .tf-playback-bar-info { display: flex; flex-direction: column; min-width: 0; }
-    .tf-playback-bar-label {
-        font-size: 0.68rem;
-        font-weight: 700;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
+        justify-content: center;
+        font-size: 1.1rem;
         color: #6EE7B7;
-        margin-bottom: 0.15rem;
     }
-    .tf-playback-bar-track {
-        font-weight: 700;
+    .tf-collection-text { min-width: 0; flex: 1; overflow: hidden; }
+    .tf-collection-title {
+        font-weight: 600;
+        font-size: 0.86rem;
         color: #F0FDF9;
-        font-size: 1rem;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        max-width: 360px;
+        display: block;
     }
-    .tf-playback-bar-artist { color: #9CB8B0; font-size: 0.84rem; }
+    .tf-collection-artist {
+        font-size: 0.74rem;
+        color: #7E978F;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        display: block;
+    }
+    .tf-now-playing-tag {
+        font-size: 0.62rem;
+        font-weight: 700;
+        color: #6EE7B7;
+        letter-spacing: 0.03em;
+        text-transform: uppercase;
+    }
 
-    /* ---------- Search-result candidate card (Feature 1) ---------- */
+    /* ---------- Now Playing Panel ---------- */
+    .tf-nowplaying-title { font-weight: 700; font-size: 1.1rem; color: #F0FDF9; margin: 0; }
+    .tf-nowplaying-artist { color: #8FE6C4; font-size: 0.88rem; margin: 0.1rem 0 0.6rem 0; }
+
+    /* ---------- Search-result candidate card ---------- */
     .tf-candidate {
         background: rgba(255,255,255,0.03);
         border: 1px solid rgba(255,255,255,0.07);
@@ -419,31 +429,6 @@ CUSTOM_CSS = """
         color: #7E978F;
         margin: 0.1rem 0 0 0;
     }
-    .tf-confidence-pill {
-        display: inline-block;
-        font-size: 0.66rem;
-        font-weight: 700;
-        letter-spacing: 0.03em;
-        padding: 0.1rem 0.5rem;
-        border-radius: 999px;
-        text-transform: uppercase;
-        margin-left: 0.4rem;
-    }
-    .tf-confidence-high {
-        background: rgba(16,185,129,0.15);
-        color: #6EE7B7;
-        border: 1px solid rgba(16,185,129,0.35);
-    }
-    .tf-confidence-refined {
-        background: rgba(167,139,250,0.15);
-        color: #C4B5FD;
-        border: 1px solid rgba(167,139,250,0.35);
-    }
-    .tf-confidence-low {
-        background: rgba(245,158,11,0.15);
-        color: #FCD34D;
-        border: 1px solid rgba(245,158,11,0.35);
-    }
 
     /* ---------- Buttons ---------- */
     .stButton > button {
@@ -471,15 +456,7 @@ CUSTOM_CSS = """
         cursor: default !important;
     }
 
-    div[data-testid="stFormSubmitButton"] button {
-        background: linear-gradient(135deg, #10B981, #047857) !important;
-        color: #06120D !important;
-        border: none !important;
-        font-weight: 700 !important;
-        width: 100%;
-    }
-
-    /* Primary CTA (Generate Recommendations) */
+    /* Primary CTA (Find Recommendations) */
     .tf-primary-btn .stButton > button {
         background: linear-gradient(135deg, #10B981, #059669) !important;
         color: #06120D !important;
@@ -491,7 +468,7 @@ CUSTOM_CSS = """
         box-shadow: 0 0 24px rgba(16,185,129,0.3) !important;
     }
 
-    /* Secondary CTA (Search Track) */
+    /* Secondary CTA (Search Song) */
     .tf-search-btn .stButton > button {
         background: linear-gradient(135deg, rgba(110,231,183,0.16), rgba(16,185,129,0.05)) !important;
         color: #6EE7B7 !important;
@@ -501,6 +478,32 @@ CUSTOM_CSS = """
     }
     .tf-search-btn .stButton > button:hover {
         border-style: solid !important;
+    }
+
+    /* Armed destructive state (Clear Playlist, second-click confirm) */
+    .tf-armed-btn .stButton > button {
+        background: linear-gradient(135deg, rgba(248,113,113,0.22), rgba(127,29,29,0.25)) !important;
+        color: #FCA5A5 !important;
+        border: 1px solid rgba(248,113,113,0.5) !important;
+        font-weight: 700 !important;
+        animation: tf-armed-pulse 1.4s ease-in-out infinite;
+    }
+    .tf-armed-btn .stButton > button:hover {
+        background: linear-gradient(135deg, #EF4444, #B91C1C) !important;
+        color: #FEF2F2 !important;
+        border-color: #FCA5A5 !important;
+    }
+    @keyframes tf-armed-pulse {
+        0%, 100% { box-shadow: 0 0 0 rgba(248,113,113,0.0); }
+        50% { box-shadow: 0 0 16px rgba(248,113,113,0.45); }
+    }
+
+    div[data-testid="stFormSubmitButton"] button {
+        background: linear-gradient(135deg, #10B981, #047857) !important;
+        color: #06120D !important;
+        border: none !important;
+        font-weight: 700 !important;
+        width: 100%;
     }
 
     /* ---------- Inputs ---------- */
@@ -524,27 +527,6 @@ CUSTOM_CSS = """
         background: linear-gradient(90deg, #047857, #10B981) !important;
     }
 
-    /* ---------- Tabs ---------- */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 6px;
-        background: rgba(255,255,255,0.02);
-        padding: 6px;
-        border-radius: 14px;
-        border: 1px solid rgba(255,255,255,0.06);
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 44px;
-        border-radius: 10px;
-        color: #9CB8B0;
-        font-weight: 600;
-        font-size: 0.92rem;
-    }
-    .stTabs [aria-selected="true"] {
-        background: linear-gradient(135deg, rgba(16,185,129,0.22), rgba(16,185,129,0.08)) !important;
-        color: #6EE7B7 !important;
-        border: 1px solid rgba(16,185,129,0.3);
-    }
-
     /* ---------- Radio / Segmented ---------- */
     div[role="radiogroup"] label {
         background: rgba(255,255,255,0.03);
@@ -559,14 +541,14 @@ CUSTOM_CSS = """
     .tf-divider {
         border: none;
         border-top: 1px solid rgba(255,255,255,0.08);
-        margin: 1.1rem 0;
+        margin: 1rem 0;
     }
     .tf-empty-state {
         text-align: center;
-        padding: 2.4rem 1rem;
+        padding: 2rem 1rem;
         color: #6B8580;
     }
-    .tf-empty-state .tf-emoji { font-size: 2.4rem; display: block; margin-bottom: 0.6rem; }
+    .tf-empty-state .tf-emoji { font-size: 2.1rem; display: block; margin-bottom: 0.5rem; }
 
     /* Metric-like stat chip */
     .tf-stat-chip {
@@ -574,13 +556,13 @@ CUSTOM_CSS = """
         background: rgba(16,185,129,0.1);
         border: 1px solid rgba(16,185,129,0.3);
         border-radius: 10px;
-        padding: 0.5rem 1rem;
+        padding: 0.45rem 0.9rem;
         color: #6EE7B7;
         font-weight: 700;
-        font-size: 1.1rem;
-        margin-right: 0.6rem;
+        font-size: 1rem;
+        margin-right: 0.5rem;
     }
-    .tf-stat-chip span { display: block; font-size: 0.68rem; color: #9CB8B0; font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; }
+    .tf-stat-chip span { display: block; font-size: 0.64rem; color: #9CB8B0; font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; }
 
     /* Download button styling override */
     div[data-testid="stDownloadButton"] button {
@@ -605,11 +587,23 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # ===========================================================================
 
 class RecommendedTrack(BaseModel):
-    """Strict schema Gemini must follow for every recommendation."""
+    """
+    Strict schema Gemini must follow for every recommendation.
+
+    [DATA MODEL CHANGE] The single free-text "Reason" sentence is replaced
+    by MatchingAttributes — exactly 3 short categorical tags. These render
+    as inline pill badges in the feed instead of a sentence, matching the
+    attribute-tag pattern consumer streaming apps use (e.g. "Mood",
+    "Tempo", "Era" chips) rather than reading like an AI explaining itself.
+    """
     Song: str = Field(description="The title of the recommended track.")
     Artist: str = Field(description="The artist name.")
-    Reason: str = Field(
-        description="A short, clear explanation of WHY this song was chosen."
+    MatchingAttributes: List[str] = Field(
+        description=(
+            'Exactly 3 short, case-insensitive 1-to-2 word categorical '
+            'matching tags, e.g., ["Sonic Match", "Tempo Sync", '
+            '"90s Nostalgia", "Genre Fusion", "Mood Align"]'
+        )
     )
 
 
@@ -618,7 +612,7 @@ class RecommendationList(BaseModel):
 
 
 class ParsedTitle(BaseModel):
-    """Strict schema for the Gemini micro-parse fallback (Bug Fix #3 / #5)."""
+    """Strict schema for the Gemini micro-parse fallback."""
     artist: str = Field(description="The primary recording singer/artist's name only — a person or group, never a movie/film/album name, no featured artists, no promotional text.")
     title: str = Field(description="The actual standalone song title only — never a movie/film/album name, never a language or genre tag, no promotional text.")
 
@@ -633,28 +627,44 @@ class SeedTrack:
     refine_note: str = ""   # diagnostic: why Gemini refinement didn't happen/help, if applicable
 
 
+def get_track_attributes(track: dict) -> List[str]:
+    """
+    Reads MatchingAttributes off a track dict, with a graceful fallback for
+    older saved/backed-up tracks that still carry the legacy single-sentence
+    "Reason" field (from before this revision) — shown as a single pill
+    instead of failing to render or losing the information on restore.
+    """
+    attrs = track.get("MatchingAttributes")
+    if isinstance(attrs, list) and attrs:
+        return [str(a) for a in attrs[:3]]
+    legacy_reason = track.get("Reason")
+    if legacy_reason:
+        return [str(legacy_reason)]
+    return []
+
+
 # ===========================================================================
 # 5. SESSION STATE INITIALIZATION
 # ===========================================================================
 
 def init_session_state():
     defaults = {
-        "recommendations": [],          # list of dicts: Song, Artist, Reason
-        "playlist_vault": [],           # list of dicts: Song, Artist, Reason
+        "recommendations": [],          # list of dicts: Song, Artist, MatchingAttributes
+        "playlist_vault": [],           # list of dicts: Song, Artist, MatchingAttributes
         "now_playing": None,            # dict: {"Song":..., "Artist":..., "video_id":...}
         "last_seed": None,              # SeedTrack as dict
         "has_generated": False,
         "working_model": None,          # whichever Gemini model actually succeeded
-        "search_candidates": [],        # list of dicts from YouTube search, for Feature 1
+        "search_candidates": [],        # list of dicts from YouTube search, for Search Song
         "confirmed_seed": None,         # dict: {"artist":..., "title":..., "video_id":...} once user confirms a candidate
         "last_search_query": "",        # actual augmented query sent to YouTube search
         "last_search_display_query": "",  # clean user-facing version (no injected keywords)
         "search_performed": False,      # persists across reruns (fixes a transient-button-state bug)
-        "auto_generate_enabled": True,  # [UX FEATURE] auto-generate recommendations on seed confirm
+        "auto_generate_enabled": True,  # auto-generate recommendations on seed confirm
         "_last_auto_generated_fingerprint": None,  # guards against re-triggering on every rerun
-        "_last_restored_upload_id": None,  # guards against re-importing the same vault file every rerun
-        "current_queue_index": None,    # [FEATURE] index into playlist_vault for Next/Previous — None when playback isn't sourced from the vault queue
-        "confirm_clear_pending": False,  # [UX] tracks the single-click-then-confirm flow for Clear Playlist
+        "_last_restored_upload_id": None,  # guards against re-importing the same backup file every rerun
+        "current_queue_index": None,    # index into playlist_vault for Next/Previous — None when playback isn't sourced from the queue
+        "confirm_clear_pending": False,  # tracks the single-click-then-confirm flow for Clear Playlist
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -759,11 +769,11 @@ def fetch_youtube_title(video_id: str) -> Optional[str]:
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_youtube_description(video_id: str, api_key: str) -> Optional[str]:
     """
-    [BUG FIX] oEmbed (used by fetch_youtube_title above) does NOT expose the
-    video description at all — only title/author/thumbnail. Many regional
-    uploads put the authoritative "Song: X / Movie: Y / Singer: Z" labels in
-    the DESCRIPTION, not the title, so without this the parser never even
-    sees that structured information.
+    oEmbed (used by fetch_youtube_title above) does NOT expose the video
+    description at all — only title/author/thumbnail. Many regional
+    uploads put the authoritative "Song: X / Movie: Y / Singer: Z" labels
+    in the DESCRIPTION, not the title, so without this the parser never
+    even sees that structured information.
 
     This uses the official YouTube Data API v3 videos.list endpoint
     (part=snippet), which DOES include the description, at a cost of just 1
@@ -811,12 +821,12 @@ _RUN_TOGETHER_SIGNAL = re.compile(r"[a-z][A-Z]")
 
 def extract_labels_from_description(description: str) -> dict:
     """
-    [BUG FIX] Fast, free, zero-API-call extraction of explicit "Song:" /
-    "Singer:" / "Artist:" / "Track:" labels from a video DESCRIPTION (not
-    title). When present and cleanly spaced (very common on official
-    Bollywood/Punjabi label uploads), this is authoritative and far more
-    reliable than any title-string heuristic — it's the uploader directly
-    telling us which field is which.
+    Fast, free, zero-API-call extraction of explicit "Song:" / "Singer:" /
+    "Artist:" / "Track:" labels from a video DESCRIPTION (not title). When
+    present and cleanly spaced (very common on official Bollywood/Punjabi
+    label uploads), this is authoritative and far more reliable than any
+    title-string heuristic — it's the uploader directly telling us which
+    field is which.
 
     Returns a dict like {"song": "Ho Gaya Talli", "singer": "Diljit Dosanjh"}
     with whichever labels were found. Returns an empty dict if no labels are
@@ -870,7 +880,7 @@ def clean_youtube_title(raw_title: str) -> str:
 def _is_structurally_complex(cleaned_title: str) -> bool:
     """
     Decides whether a cleaned title is simple enough for pure regex, or
-    complex enough to need the Gemini micro-parse fallback (Bug Fix #3).
+    complex enough to need the Gemini micro-parse fallback.
 
     "Complex" = 2 or more pipe characters, OR a mix of pipes AND dashes,
     OR 3+ total separators of any kind. These are the corporate-upload
@@ -911,21 +921,12 @@ def split_artist_title_regex(cleaned_title: str) -> SeedTrack:
     # unavailable, or as a sanity check against it) — explicitly
     # low-confidence, since 3+ segment titles are genuinely ambiguous.
     #
-    # [BUG FIX] Earlier versions assumed a FIXED POSITION: "first segment is
-    # always the artist, last segment is always the title". That assumption
-    # is wrong about as often as it's right — regional uploads commonly use
-    # BOTH "Title - Artist | Movie | tag" AND "Artist | Movie | tag - Title"
-    # orderings interchangeably, so a position-only rule silently picks the
-    # movie name as the title whenever the order flips (e.g. "Sargi" picked
-    # instead of "Fer Ohi Hoyea").
-    #
-    # Instead, this uses a CONTENT-based signal that doesn't care about
-    # position: the segment containing a comma (e.g. "Jassi Gill, Rubina
-    # Bajwa" — primary singer + featured actor/actress) is reliably the
-    # artist list in this title format, regardless of where it falls in the
-    # string. The primary artist is the first name before the comma. Some
-    # uploads join co-stars with "&" instead of a comma (e.g. "Diljit
-    # Dosanjh & Sonam Bajwa") — treated the same way.
+    # Position-agnostic signal: the segment containing a comma (e.g. "Jassi
+    # Gill, Rubina Bajwa" — primary singer + featured actor/actress) is
+    # reliably the artist list in this title format, regardless of where it
+    # falls in the string. The primary artist is the first name before the
+    # comma. Some uploads join co-stars with "&" instead of a comma (e.g.
+    # "Diljit Dosanjh & Sonam Bajwa") — treated the same way.
     segments = re.split(r"\s*\|\s*|\s+[-–—]\s+", cleaned_title)
     segments = [s.strip() for s in segments if s.strip()]
 
@@ -987,28 +988,16 @@ def refine_title_with_gemini(messy_title: str, description: Optional[str] = None
     model-fallback chain and fails silently (returns None) so callers always
     have the regex guess as a safety net.
 
-    [BUG FIX] An earlier revision assumed the song title is always the LAST
-    segment of the string. That is wrong about as often as it's right —
-    real-world regional uploads use BOTH orderings interchangeably:
-        "Jassi Gill, Rubina Bajwa | Sargi | Latest Punjabi Song — Fer Ohi Hoyea"
-        "Fer Ohi Hoyea - Jassi Gill, Rubina Bajwa | Sargi | Latest Punjabi Song"
-    are the SAME song, with the title in opposite positions. A fixed-position
-    rule silently mis-picks the movie name ("Sargi") as the title whenever
-    the order flips. This prompt now uses POSITION-AGNOSTIC reasoning
-    instead: the comma-containing segment (multiple names) is reliably the
-    artist list wherever it falls, and a short single-word segment is
-    reliably the movie/album name wherever IT falls — neither rule depends
-    on first/last position.
+    Uses POSITION-AGNOSTIC reasoning: real-world regional uploads use BOTH
+    title-first and title-last orderings interchangeably for the same song,
+    so a fixed-position rule would silently mis-pick the movie name as the
+    title whenever the order flips. The comma- (or "&"-) containing segment
+    is reliably the artist/cast list wherever it falls; a short single-word
+    segment is reliably the movie/album name wherever IT falls.
 
-    [BUG FIX] Also accepts the video DESCRIPTION when available. oEmbed
-    (used for the title) never exposes the description, so earlier
-    revisions never saw the explicit "Song:"/"Singer:" labels that many
-    regional uploads put there instead of in the title — this was the
-    actual root cause behind cases like "Ho Gaya Talli | Super Singh |
-    Diljit Dosanjh & Sonam Bajwa | Jatinder Shah" (no comma — co-stars
-    joined with "&" instead — so the title-only heuristic had no reliable
-    signal at all, while the description plainly states
-    "Song - Ho Gaya Talli Movie - Super Singh Singer - Diljit Dosanjh").
+    Also accepts the video DESCRIPTION when available, since oEmbed (used
+    for the title) never exposes it, and many regional uploads put the
+    authoritative "Song:"/"Singer:" labels there instead of in the title.
     """
     client = get_genai_client()
     if client is None:
@@ -1106,11 +1095,10 @@ def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
       1. Extract video ID.
       2. Fetch raw title (oEmbed, no key needed) -> clean fluff -> Tier A/B
          regex split.
-      3. [BUG FIX] If a YOUTUBE_API_KEY is configured, ALSO fetch the video
+      3. If a YOUTUBE_API_KEY is configured, ALSO fetch the video
          DESCRIPTION (oEmbed never exposes this — only the Data API does).
          Regional uploads frequently put authoritative "Song:"/"Singer:"
-         labels in the description rather than the title, which earlier
-         revisions never even looked at.
+         labels in the description rather than the title.
       4. If the regex split is low-confidence: try the free description
          label extractor first (instant, no API call); if that doesn't
          resolve it, fall back to a Gemini micro-call given BOTH the title
@@ -1150,7 +1138,7 @@ def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
     # available) for maximum context — Gemini handles run-together/messy
     # description text far better than regex can.
     if not allow_gemini_refine:
-        seed.refine_note = "Gemini refinement skipped for this call."
+        seed.refine_note = "Refinement skipped for this call."
     elif not get_api_key():
         seed.refine_note = "Add a GEMINI_API_KEY to enable automatic refinement of complex titles like this one."
     else:
@@ -1160,18 +1148,18 @@ def parse_youtube_link(url: str, allow_gemini_refine: bool = True) -> SeedTrack:
             seed.title = refined.title
             seed.parse_confidence = "refined"
         else:
-            seed.refine_note = "Gemini refinement was attempted but didn't return a confident result — please double-check the fields below."
+            seed.refine_note = "Refinement was attempted but didn't return a confident result."
 
     return seed
 
 
 def build_music_search_query(typed_artist: str, typed_title: str) -> str:
     """
-    [UX FIX] Constructs the YouTube search query used by the "🔍 Search
-    Track" verification step. A bare single-keyword query (e.g. just
-    "diljit" or just "aha") returns broad, irrelevant results from YouTube's
-    general search — talk-show clips, Shorts, or even OTT platform promos
-    (e.g. the "aha" streaming service) instead of actual songs.
+    Constructs the YouTube search query used by the Search Song verification
+    step. A bare single-keyword query (e.g. just "diljit" or just "aha")
+    returns broad, irrelevant results from YouTube's general search —
+    talk-show clips, Shorts, or even OTT platform promos instead of actual
+    songs.
 
     To keep results strictly music-focused without requiring the user to
     type anything extra, this appends explicit audio/music modifiers behind
@@ -1203,12 +1191,21 @@ def build_youtube_watch_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
 
 
+def build_youtube_thumbnail_url(video_id: str) -> str:
+    """
+    YouTube thumbnails follow a predictable URL pattern keyed only on the
+    video ID — no API call needed. Used for the compact rounded-square
+    thumbnails in the "Up Next" collection rows.
+    """
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def search_youtube_video_id(query: str, api_key: str) -> Optional[str]:
     """
     Resolves a search query to a single best-match real YouTube video ID
     using the official YouTube Data API v3 search.list endpoint. Used for
-    auto-resolving playback on AI recommendations (no key = graceful None).
+    auto-resolving playback on recommendations (no key = graceful None).
     """
     results = search_youtube_tracks(query, api_key, max_results=1)
     return results[0]["video_id"] if results else None
@@ -1217,10 +1214,9 @@ def search_youtube_video_id(query: str, api_key: str) -> Optional[str]:
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def search_youtube_tracks(query: str, api_key: str, max_results: int = 5) -> List[dict]:
     """
-    [FEATURE 1] Resolves a search query to multiple candidate videos via the
-    official YouTube Data API v3 search.list endpoint, so the user can
-    explicitly confirm which exact track they mean before generating
-    recommendations.
+    Resolves a search query to multiple candidate videos via the official
+    YouTube Data API v3 search.list endpoint, so the user can explicitly
+    confirm which exact track they mean before generating recommendations.
 
     Returns a list of dicts: {video_id, title, channel, thumbnail}.
     Returns an empty list on any failure (no key, bad key, quota exceeded,
@@ -1280,24 +1276,26 @@ def get_genai_client() -> Optional[genai.Client]:
 
 def build_recommendation_prompt(artist: str, title: str, num_recs: int) -> str:
     return f"""
-You are TrackFind, an expert AI music curator with encyclopedic knowledge of
-songs, artists, genres, eras, moods, and musical structure.
+You are an expert music curator with encyclopedic knowledge of songs,
+artists, genres, eras, moods, and musical structure.
 
 A user has provided this seed track:
     Artist: "{artist or 'Unknown'}"
     Title:  "{title or 'Unknown'}"
 
 Recommend exactly {num_recs} songs that a fan of this track would genuinely
-enjoy. Use a healthy mix of reasoning angles across the list — sonic/mood
+enjoy. Use a healthy mix of matching angles across the list — sonic/mood
 similarity, shared genre or subgenre, same era, shared collaborators or
 influences, similar tempo/instrumentation, or thematic/lyrical similarity.
 
 Rules:
 - Do NOT include the seed track itself in the results.
 - Do NOT repeat the same song twice.
-- Each "Reason" must be ONE short, specific sentence (under 15 words),
-  e.g. "Similar dark-pop mood", "Same dynamic tempo and bassline",
-  "Iconic late-90s era match", "Collaborated with the same artist".
+- For each track, provide exactly 3 MatchingAttributes: short, 1-to-2 word
+  categorical tags describing WHY it matches (e.g. "Sonic Match", "Tempo
+  Sync", "90s Nostalgia", "Genre Fusion", "Mood Align", "Same Collaborator",
+  "Vocal Style", "Era Match"). These are tags, not sentences — case
+  doesn't matter, but keep each tag to 1-2 words.
 - Favor real, well-known, verifiable songs and artists.
 - Return ONLY the structured data — no preamble, no extra commentary.
 """.strip()
@@ -1333,7 +1331,8 @@ def _call_gemini_model(client: "genai.Client", model_name: str, prompt: str) -> 
 def get_recommendations(artist: str, title: str, num_recs: int) -> List[dict]:
     """
     Calls Gemini with a forced JSON schema (Pydantic) so the response is
-    guaranteed to match: [{"Song":..., "Artist":..., "Reason":...}, ...]
+    guaranteed to match:
+        [{"Song":..., "Artist":..., "MatchingAttributes": [...3 tags]}, ...]
 
     Google periodically retires Gemini model IDs (gemini-1.5-flash and
     gemini-2.0-flash are both already shut down as of mid-2026). To keep
@@ -1344,7 +1343,7 @@ def get_recommendations(artist: str, title: str, num_recs: int) -> List[dict]:
     client = get_genai_client()
     if client is None:
         raise RuntimeError(
-            "Gemini API key not configured. Add GEMINI_API_KEY to your "
+            "No Gemini API key configured. Add GEMINI_API_KEY to your "
             "Streamlit secrets or environment variables."
         )
 
@@ -1374,21 +1373,23 @@ def get_recommendations(artist: str, title: str, num_recs: int) -> List[dict]:
                 raise
 
     raise RuntimeError(
-        f"None of the configured Gemini models are available for this API key "
+        f"None of the configured models are available for this API key "
         f"(tried: {', '.join(candidates)}). Last error: {last_error}"
     )
 
 
 # ===========================================================================
-# 8. HELPER UI FUNCTIONS
+# 8. HELPER FUNCTIONS — COLLECTION, QUEUE, BACKUP
 # ===========================================================================
 
 def render_hero():
     st.markdown(
         f"""
         <div class="tf-hero">
-            <h1>{APP_TITLE}</h1>
-            <p>Discover your next favorite track — powered by Gemini AI, styled for the way you actually listen.</p>
+            <div>
+                <p class="tf-hero-title">{APP_TITLE}</p>
+                <p class="tf-hero-tagline">{APP_TAGLINE}</p>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1396,13 +1397,14 @@ def render_hero():
 
 
 def add_to_playlist(track: dict):
+    """
+    Adds a track to the collection ("Up Next"). Resolves a real YouTube
+    link and a thumbnail at save-time so the compact collection rows and
+    any backup export always have a playable URL and a real image.
+    """
     existing = {(t["Song"].lower(), t["Artist"].lower()) for t in st.session_state.playlist_vault}
     key = (track["Song"].lower(), track["Artist"].lower())
     if key not in existing:
-        # [FEATURE] Resolve a real YouTube link at save-time so exports can
-        # include a playable URL, not just text. Uses the official Data API
-        # (already cached) when a key is configured; falls back to a
-        # YouTube search URL otherwise so the field is never empty.
         video_id = track.get("video_id", "")
         if not video_id:
             yt_key = get_youtube_api_key()
@@ -1413,23 +1415,25 @@ def add_to_playlist(track: dict):
         if video_id:
             track["video_id"] = video_id
             track["youtube_url"] = build_youtube_watch_url(video_id)
+            track["thumbnail_url"] = build_youtube_thumbnail_url(video_id)
         else:
             query = f"{track.get('Artist','')} {track.get('Song','')}".strip()
             track["youtube_url"] = build_youtube_search_url(query) if query else ""
+            track["thumbnail_url"] = ""
 
         st.session_state.playlist_vault.append(track)
-        st.toast(f"Added '{track['Song']}' to your Playlist Vault ✅", icon="🎶")
+        st.toast(f"Added \u2018{track['Song']}\u2019 to Up Next")
     else:
-        st.toast(f"'{track['Song']}' is already in your vault.", icon="ℹ️")
+        st.toast(f"\u2018{track['Song']}\u2019 is already in your collection")
 
 
 def remove_from_playlist(index: int):
     if 0 <= index < len(st.session_state.playlist_vault):
         removed = st.session_state.playlist_vault.pop(index)
-        st.toast(f"Removed '{removed['Song']}' from your vault.", icon="🗑️")
+        st.toast(f"Removed \u2018{removed['Song']}\u2019")
 
-        # [BUG FIX] Keep the active queue index consistent after a deletion
-        # so Next/Previous don't silently point at the wrong track.
+        # Keep the active queue index consistent after a deletion so
+        # Next/Previous don't silently point at the wrong track.
         current_idx = st.session_state.get("current_queue_index")
         if current_idx is not None:
             if index == current_idx:
@@ -1443,10 +1447,9 @@ def remove_from_playlist(index: int):
 
 def load_queue_track(index: int):
     """
-    [FEATURE] Loads the vault track at `index` into the player and marks it
-    as the active queue position, so subsequent Next/Previous clicks know
-    where they are. Used by the vault's own "▶️ Play" buttons AND by the
-    Previous/Next controls under the player.
+    Loads the collection track at `index` into the player and marks it as
+    the active queue position, so subsequent Next/Previous clicks know
+    where they are.
     """
     vault = st.session_state.playlist_vault
     if not (0 <= index < len(vault)):
@@ -1457,12 +1460,12 @@ def load_queue_track(index: int):
         "Song": track.get("Song", ""),
         "Artist": track.get("Artist", ""),
         "video_id": track.get("video_id", ""),
-        "Reason": track.get("Reason", ""),
+        "MatchingAttributes": track.get("MatchingAttributes", []),
     }
 
 
 def queue_play_next():
-    """[FEATURE] Advances the queue by one track, if not already at the end."""
+    """Advances the queue by one track, if not already at the end."""
     idx = st.session_state.get("current_queue_index")
     vault = st.session_state.playlist_vault
     if idx is None or not vault:
@@ -1472,7 +1475,7 @@ def queue_play_next():
 
 
 def queue_play_previous():
-    """[FEATURE] Steps the queue back by one track, if not already at the start."""
+    """Steps the queue back by one track, if not already at the start."""
     idx = st.session_state.get("current_queue_index")
     vault = st.session_state.playlist_vault
     if idx is None or not vault:
@@ -1483,13 +1486,13 @@ def queue_play_previous():
 
 def move_track_in_vault(index: int, direction: int):
     """
-    [FEATURE] Swaps the track at `index` with its neighbor at `index +
-    direction` (direction is -1 for "move up", +1 for "move down"). No-ops
-    safely if the swap would go out of bounds.
+    Swaps the track at `index` with its neighbor at `index + direction`
+    (direction is -1 for "move up", +1 for "move down"). No-ops safely if
+    the swap would go out of bounds.
 
-    [BUG FIX] Keeps `current_queue_index` pointed at the SAME TRACK (not the
-    same numeric slot) across the swap — without this, reordering while a
-    track is actively playing would silently make Next/Previous jump to the
+    Keeps `current_queue_index` pointed at the SAME TRACK (not the same
+    numeric slot) across the swap — without this, reordering while a track
+    is actively playing would silently make Next/Previous jump to the
     wrong song, since the integer index alone doesn't follow the track when
     its position changes.
     """
@@ -1515,35 +1518,37 @@ def move_track_in_vault(index: int, direction: int):
 
 def playlist_to_json_bytes() -> bytes:
     """
-    Full-fidelity export of the playlist vault as JSON — every field saved
-    per track (Song, Artist, Reason — the mood/match explanation Gemini
-    gave when recommending it — video_id, and youtube_url) comes along
-    automatically since this is a direct dump of the stored track dicts.
-    This is what powers "resume later" without requiring an account: a
-    returning user just re-uploads this file to restore their playlist.
+    Full-fidelity backup of the collection as JSON — every field saved per
+    track (Song, Artist, MatchingAttributes, video_id, youtube_url,
+    thumbnail_url) comes along automatically since this is a direct dump of
+    the stored track dicts. This is what powers "Backup Session" /
+    spreadsheet-free resume without requiring an account: a returning user
+    just re-uploads this file to restore their collection.
     """
     payload = {
-        "trackfind_export_version": 1,
+        "trackfind_export_version": 2,
         "playlist_vault": st.session_state.playlist_vault,
     }
     return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
 
 
-def restore_playlist_from_file(uploaded_bytes: bytes, filename: str = "") -> tuple[bool, str]:
+def restore_playlist_from_file(uploaded_bytes: bytes, filename: str = "") -> tuple:
     """
-    Parses a previously-downloaded playlist file and restores it into the
-    current session's vault — merging with, not replacing, anything
+    Parses a previously-downloaded backup file and restores it into the
+    current session's collection — merging with, not replacing, anything
     already saved (duplicates by Song+Artist are skipped). Returns
-    (success, message).
+    (success, message). Tracks from the older export format (version 1,
+    with a legacy "Reason" string instead of MatchingAttributes) are
+    restored as-is; get_track_attributes() reads either format gracefully.
     """
     try:
         data = json.loads(uploaded_bytes.decode("utf-8"))
     except Exception:
-        return False, "That file couldn't be read — try downloading a fresh copy of your playlist and uploading that."
+        return False, "That file couldn't be read — try downloading a fresh backup and uploading that."
 
     tracks = data.get("playlist_vault")
     if not isinstance(tracks, list):
-        return False, "That file doesn't contain a recognizable playlist."
+        return False, "That file doesn't contain a recognizable collection."
 
     existing = {(t.get("Song", "").lower(), t.get("Artist", "").lower()) for t in st.session_state.playlist_vault}
     added = 0
@@ -1557,482 +1562,641 @@ def restore_playlist_from_file(uploaded_bytes: bytes, filename: str = "") -> tup
             added += 1
 
     if added == 0:
-        return True, "No new tracks to add — everything in that file is already in your vault."
-    return True, f"Restored {added} track{'s' if added != 1 else ''} into your vault."
+        return True, "No new tracks to add — everything in that file is already in your collection."
+    return True, f"Restored {added} track{'s' if added != 1 else ''}."
 
 
 # ===========================================================================
-# 9. RENDER: HERO HEADER
+# 9. RENDER: TOP BAR
 # ===========================================================================
 
 render_hero()
 
 
 # ===========================================================================
-# 10. TABS
+# 10. SINGLE-PAGE STREAMING WORKSPACE (no tabs)
 # ===========================================================================
+# LEFT  (narrower, 1.1): the player + the active queue ("Up Next") + backup.
+# RIGHT (wider,   1.4): discovery input + controls + the recommendation feed.
+# On narrow/mobile viewports these stack vertically (Streamlit's default
+# column behavior below its mobile breakpoint) with the player/queue first.
 
-tab_discover, tab_vault = st.tabs(["🔎  Discover & Sync", "🎧  My Playlist Vault"])
+col_queue, col_discover = st.columns([1.1, 1.4], gap="large")
 
 
-# ---------------------------------------------------------------------------
-# TAB 1: DISCOVER & SYNC
-# ---------------------------------------------------------------------------
-with tab_discover:
+def run_generation(artist: str, title: str, count: int, video_id: str = ""):
+    """
+    Shared generation routine used by both the manual "Find Recommendations"
+    button AND the auto-generate trigger, so the two paths can't drift out
+    of sync.
+    """
+    if not title and not artist:
+        st.error("Add a track title or artist before finding recommendations.")
+        return
+    try:
+        with st.spinner(f"Finding {count} tracks for you..."):
+            results = get_recommendations(artist, title, count)
+        st.session_state.recommendations = results
+        st.session_state.has_generated = True
+        st.session_state.last_seed = {"artist": artist, "title": title}
+        st.session_state.current_queue_index = None
+        st.session_state.now_playing = {
+            "Song": title,
+            "Artist": artist,
+            "video_id": video_id,
+        }
+        st.success(f"Found {len(results)} tracks based on '{title or artist}'.")
+    except RuntimeError as e:
+        st.error(str(e))
+    except Exception as e:
+        st.error(f"Something went wrong while finding recommendations: {e}")
 
-    col_input, col_player = st.columns([1.35, 1], gap="large")
 
-    # -------------------- LEFT COLUMN: INPUT & CONTROLS --------------------
-    with col_input:
-        st.markdown('<div class="tf-card">', unsafe_allow_html=True)
-        st.markdown('<div class="tf-card-title">🎯 Seed Track Input</div>', unsafe_allow_html=True)
+# ===========================================================================
+# LEFT COLUMN — NOW PLAYING + UP NEXT + BACKUP SESSION
+# ===========================================================================
+with col_queue:
 
-        input_mode = st.radio(
-            "Choose input method",
-            options=["🎤 Artist + Track", "🔗 YouTube Link"],
-            horizontal=True,
-            label_visibility="collapsed",
-            key="input_mode_radio",
+    # -------------------- NOW PLAYING --------------------
+    st.markdown('<div class="tf-card">', unsafe_allow_html=True)
+    st.markdown('<div class="tf-card-title">Now Playing</div>', unsafe_allow_html=True)
+
+    now_playing = st.session_state.now_playing
+    queue_idx = st.session_state.get("current_queue_index")
+    in_queue_mode = queue_idx is not None and 0 <= queue_idx < len(st.session_state.playlist_vault)
+
+    if now_playing and (now_playing.get("Song") or now_playing.get("Artist")):
+        song = now_playing.get("Song", "")
+        artist = now_playing.get("Artist", "")
+        video_id = now_playing.get("video_id", "")
+
+        st.markdown(f'<p class="tf-nowplaying-title">{song}</p>', unsafe_allow_html=True)
+        st.markdown(f'<p class="tf-nowplaying-artist">{artist}</p>', unsafe_allow_html=True)
+
+        # If we don't already have a confirmed video (e.g. this came from a
+        # recommendation or manual typing rather than a pasted link or
+        # confirmed search result), try to auto-resolve a real one via the
+        # YouTube Data API — but only if that optional key is configured.
+        if not video_id:
+            yt_key = get_youtube_api_key()
+            if yt_key:
+                query = f"{artist} {song}".strip()
+                if query:
+                    with st.spinner("Finding video..."):
+                        resolved_id = search_youtube_video_id(query, yt_key)
+                    if resolved_id:
+                        video_id = resolved_id
+                        st.session_state.now_playing["video_id"] = resolved_id
+
+        if video_id:
+            watch_url = build_youtube_watch_url(video_id)
+            st.video(watch_url, autoplay=True)
+        else:
+            query = f"{artist} {song}".strip()
+            search_url = build_youtube_search_url(query) if query else ""
+            st.markdown(
+                """
+                <div class="tf-empty-state" style="padding:1.2rem 1rem;">
+                    No video found for this track yet.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            if search_url:
+                st.link_button("Find on YouTube", search_url, use_container_width=True)
+            if not get_youtube_api_key():
+                st.caption("Add a YOUTUBE_API_KEY to enable automatic playback for every recommendation.")
+
+        # Queue controller — Previous / Next, inline under the player. Only
+        # meaningfully active when the current track came from the queue
+        # (clicking play on a saved track, or navigating with these same
+        # controls); disabled entirely otherwise since there's no queue
+        # context to step through. Buttons gray out at the absolute ends.
+        st.markdown("<br>", unsafe_allow_html=True)
+        vault_len = len(st.session_state.playlist_vault)
+        ctrl_prev, ctrl_next = st.columns(2)
+        with ctrl_prev:
+            st.button(
+                "Previous",
+                key="player_prev",
+                use_container_width=True,
+                disabled=not in_queue_mode or queue_idx == 0,
+                on_click=queue_play_previous,
+            )
+        with ctrl_next:
+            st.button(
+                "Next",
+                key="player_next",
+                use_container_width=True,
+                disabled=not in_queue_mode or queue_idx == vault_len - 1,
+                on_click=queue_play_next,
+            )
+        if not in_queue_mode:
+            st.caption("Play a track from Up Next to enable queue controls.")
+
+        # Save whatever's currently playing straight to the collection,
+        # without needing to find it again in the feed.
+        st.markdown("<br>", unsafe_allow_html=True)
+        already_saved = any(
+            t.get("Song", "").lower() == song.lower() and t.get("Artist", "").lower() == artist.lower()
+            for t in st.session_state.playlist_vault
+        )
+        if already_saved:
+            st.button("Already in Up Next", use_container_width=True, disabled=True, key="add_current_saved")
+        else:
+            if st.button("Add to Up Next", use_container_width=True, key="add_current_to_playlist"):
+                add_to_playlist({
+                    "Song": song,
+                    "Artist": artist,
+                    "MatchingAttributes": now_playing.get("MatchingAttributes", []),
+                    "video_id": video_id,
+                })
+                st.rerun()
+    else:
+        st.markdown(
+            """
+            <div class="tf-empty-state">
+                Find recommendations or pick a track from Up Next to start listening.
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-        # Reset the confirmed seed if the user switches input modes, so a
-        # confirmation from one mode doesn't leak into the other.
-        if st.session_state.get("_last_input_mode") != input_mode:
-            st.session_state.confirmed_seed = None
-            st.session_state.search_candidates = []
-            st.session_state.search_performed = False
-            st.session_state["_last_input_mode"] = input_mode
+    st.markdown('</div>', unsafe_allow_html=True)
 
-        seed_artist, seed_title = "", ""
-        seed_video_id = ""
+    # -------------------- UP NEXT (collection / continuous queue) --------------------
+    st.markdown('<div class="tf-card">', unsafe_allow_html=True)
+    st.markdown('<div class="tf-card-title">Up Next</div>', unsafe_allow_html=True)
 
-        # ===================================================================
-        # MODE A: 🎤 Artist + Track  ([FEATURE] Search & Verify)
-        # ===================================================================
-        if input_mode == "🎤 Artist + Track":
-            c1, c2 = st.columns(2)
-            with c1:
-                typed_artist = st.text_input("Artist Name", placeholder="e.g. The Weeknd", key="typed_artist")
-            with c2:
-                typed_title = st.text_input("Track Title", placeholder="e.g. Blinding Lights", key="typed_title")
+    vault = st.session_state.playlist_vault
 
-            st.markdown('<div class="tf-search-btn">', unsafe_allow_html=True)
-            search_clicked = st.button("🔍 Search Track", use_container_width=True, key="search_track_btn")
-            st.markdown('</div>', unsafe_allow_html=True)
+    stat_a, stat_b = st.columns(2)
+    with stat_a:
+        st.markdown(
+            f"""<span class="tf-stat-chip">{len(vault)}<span>tracks</span></span>""",
+            unsafe_allow_html=True,
+        )
+    with stat_b:
+        unique_artists = len({t["Artist"] for t in vault}) if vault else 0
+        st.markdown(
+            f"""<span class="tf-stat-chip">{unique_artists}<span>artists</span></span>""",
+            unsafe_allow_html=True,
+        )
 
-            yt_key = get_youtube_api_key()
+    st.markdown("<br>", unsafe_allow_html=True)
 
-            # NOTE: `search_clicked` is only True on the exact script run where
-            # the button was pressed — it resets to False on every later rerun
-            # (e.g. when the user types into a fallback confirm field below).
-            # We persist the "a search was performed" state separately so the
-            # results/fallback UI doesn't vanish the instant the user
-            # interacts with anything else on the page.
-            if search_clicked:
-                display_query = f"{typed_artist} {typed_title}".strip()
-                query = build_music_search_query(typed_artist, typed_title)
-                if not query:
-                    st.error("Type an artist name and/or track title before searching.")
-                    st.session_state.search_performed = False
+    if not vault:
+        st.markdown(
+            """
+            <div class="tf-empty-state">
+                Your collection is empty. Add tracks from the feed to build your queue.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        for i, track in enumerate(vault):
+            is_current = st.session_state.get("current_queue_index") == i
+            thumb_url = track.get("thumbnail_url", "")
+            row_class = "tf-collection-row tf-collection-row-active" if is_current else "tf-collection-row"
+            now_tag = '<span class="tf-now-playing-tag">Playing</span>' if is_current else ""
+
+            r_thumb, r_text, r_play, r_up, r_down, r_del = st.columns([0.5, 2.6, 0.5, 0.42, 0.42, 0.5])
+            with r_thumb:
+                if thumb_url:
+                    st.markdown(
+                        f'<img class="tf-thumb" src="{thumb_url}" alt="">',
+                        unsafe_allow_html=True,
+                    )
                 else:
-                    st.session_state.confirmed_seed = None
-                    st.session_state.last_search_query = query
-                    st.session_state.last_search_display_query = display_query
-                    st.session_state.search_performed = True
-                    if yt_key:
-                        with st.spinner("Searching for matching tracks..."):
-                            candidates = search_youtube_tracks(query, yt_key, max_results=5)
-                        st.session_state.search_candidates = candidates
-                    else:
-                        # No YouTube key — smart fallback: skip real search,
-                        # treat the typed values as a single confirmable
-                        # candidate so the verification step still exists.
-                        st.session_state.search_candidates = []
-
-            search_performed = st.session_state.get("search_performed", False)
-
-            # ---- Render candidate results (real search) ----
-            if st.session_state.search_candidates:
-                display_query = st.session_state.get("last_search_display_query") or st.session_state.last_search_query
-                st.caption(f"Top matches for **{display_query}** — confirm the exact track:")
-                option_labels = []
-                for cand in st.session_state.search_candidates:
-                    option_labels.append(f"{cand['title']}  ·  {cand['channel']}")
-
-                chosen_label = st.radio(
-                    "Select the exact track",
-                    options=option_labels,
-                    label_visibility="collapsed",
-                    key="candidate_radio",
-                )
-                chosen_idx = option_labels.index(chosen_label) if chosen_label in option_labels else 0
-                chosen = st.session_state.search_candidates[chosen_idx]
-
-                # Show a small thumbnail preview card for the highlighted pick
+                    st.markdown('<div class="tf-thumb-placeholder">&#9834;</div>', unsafe_allow_html=True)
+            with r_text:
                 st.markdown(
                     f"""
-                    <div class="tf-candidate">
-                        <img src="{chosen['thumbnail']}" alt="thumbnail">
-                        <div>
-                            <p class="tf-candidate-title">{chosen['title']}</p>
-                            <p class="tf-candidate-channel">{chosen['channel']}</p>
+                    <div class="{row_class}" style="padding-left:0.5rem;">
+                        <div class="tf-collection-text">
+                            <span class="tf-collection-title">{track.get('Song','')}</span>
+                            <span class="tf-collection-artist">{track.get('Artist','')} {now_tag}</span>
                         </div>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
-
-                if st.button("✅ Confirm This Track", use_container_width=True, key="confirm_candidate_btn"):
-                    cleaned = clean_youtube_title(chosen["title"])
-                    guess = split_artist_title_regex(cleaned)
-                    confirmed_artist = guess.artist or typed_artist
-                    confirmed_title = guess.title or typed_title or cleaned
-                    st.session_state.confirmed_seed = {
-                        "artist": confirmed_artist,
-                        "title": confirmed_title,
-                        "video_id": chosen["video_id"],
-                    }
-                    # Instant playback the moment a track is confirmed. This
-                    # isn't vault-queue playback, so step out of queue mode.
-                    st.session_state.current_queue_index = None
-                    st.session_state.now_playing = {
-                        "Song": confirmed_title,
-                        "Artist": confirmed_artist,
-                        "video_id": chosen["video_id"],
-                    }
-                    st.toast(f"Confirmed: {confirmed_title} — {confirmed_artist} ✅", icon="🎯")
+            with r_play:
+                if st.button("\u25B6", key=f"vault_play_{i}", help="Play this track"):
+                    load_queue_track(i)
+                    st.rerun()
+            with r_up:
+                if st.button("\u25B2", key=f"vault_up_{i}", help="Move up", disabled=(i == 0)):
+                    move_track_in_vault(i, -1)
+                    st.rerun()
+            with r_down:
+                if st.button("\u25BC", key=f"vault_down_{i}", help="Move down", disabled=(i == len(vault) - 1)):
+                    move_track_in_vault(i, 1)
+                    st.rerun()
+            with r_del:
+                if st.button("\u2715", key=f"vault_remove_{i}", help="Remove"):
+                    remove_from_playlist(i)
                     st.rerun()
 
-            elif search_performed and not yt_key:
-                # Smart fallback when no YOUTUBE_API_KEY is configured: a
-                # clean manual confirmation step instead of real candidates.
-                st.info(
-                    "No `YOUTUBE_API_KEY` configured, so TrackFind can't pull real search "
-                    "matches. Confirm the details below to proceed anyway:"
-                )
-                fb_artist = st.text_input("Confirm Artist", value=typed_artist, key="fallback_artist")
-                fb_title = st.text_input("Confirm Track Title", value=typed_title, key="fallback_title")
-                if st.button("✅ Confirm This Track", use_container_width=True, key="confirm_fallback_btn"):
-                    st.session_state.confirmed_seed = {
-                        "artist": fb_artist,
-                        "title": fb_title,
-                        "video_id": "",
-                    }
-                    st.session_state.current_queue_index = None
-                    st.session_state.now_playing = {
-                        "Song": fb_title,
-                        "Artist": fb_artist,
-                        "video_id": "",
-                    }
-                    st.session_state.search_performed = False
-                    st.toast(f"Confirmed: {fb_title} — {fb_artist} ✅", icon="🎯")
-                    st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
-            elif search_performed and yt_key and not st.session_state.search_candidates:
-                st.warning("No matches found on YouTube for that search. Try simplifying the query, or confirm manually below.")
-                fb_artist = st.text_input("Confirm Artist", value=typed_artist, key="fallback_artist_noresults")
-                fb_title = st.text_input("Confirm Track Title", value=typed_title, key="fallback_title_noresults")
-                if st.button("✅ Confirm This Track", use_container_width=True, key="confirm_fallback_noresults_btn"):
-                    st.session_state.confirmed_seed = {
-                        "artist": fb_artist,
-                        "title": fb_title,
-                        "video_id": "",
-                    }
-                    st.session_state.current_queue_index = None
-                    st.session_state.now_playing = {
-                        "Song": fb_title,
-                        "Artist": fb_artist,
-                        "video_id": "",
-                    }
-                    st.session_state.search_performed = False
-                    st.toast(f"Confirmed: {fb_title} — {fb_artist} ✅", icon="🎯")
-                    st.rerun()
+    # -------------------- BACKUP SESSION --------------------
+    st.markdown('<div class="tf-card">', unsafe_allow_html=True)
+    st.markdown('<div class="tf-card-title">Backup Session</div>', unsafe_allow_html=True)
+    st.caption("No account needed — download your collection now, and upload it next time to pick up where you left off.")
 
-            # ---- Show current confirmation status ----
-            if st.session_state.confirmed_seed:
-                cs = st.session_state.confirmed_seed
-                st.success(f"🎯 Locked in: **{cs['title']}** — *{cs['artist']}*")
-                seed_artist, seed_title = cs["artist"], cs["title"]
-                seed_video_id = cs.get("video_id", "")
-            else:
-                # Allow generating straight from typed fields too (search is
-                # a recommended verification step, not a hard gate), but
-                # nudge the user toward it.
-                seed_artist, seed_title = typed_artist, typed_title
-                if (typed_artist or typed_title) and not search_performed:
-                    st.caption("💡 Tip: click **🔍 Search Track** to verify the exact match before generating recommendations.")
-
-        # ===================================================================
-        # MODE B: 🔗 YouTube Link  ([BUG FIX] Instant playback + tiered parsing)
-        # ===================================================================
-        else:
-            yt_url = st.text_input(
-                "YouTube Link",
-                placeholder="https://www.youtube.com/watch?v=...",
-                key="yt_url_input",
-            )
-
-            if yt_url:
-                # Only re-parse when the URL actually changes, to avoid
-                # re-fetching/re-parsing on every unrelated widget rerun.
-                if st.session_state.get("_last_parsed_url") != yt_url:
-                    with st.spinner("Parsing YouTube link..."):
-                        seed = parse_youtube_link(yt_url)
-                    st.session_state["_last_parsed_seed"] = asdict(seed)
-                    st.session_state["_last_parsed_url"] = yt_url
-
-                    # [BUG FIX 2] Update the player THE MOMENT we have a
-                    # video_id — independent of clicking Generate.
-                    if seed.video_id:
-                        st.session_state.current_queue_index = None
-                        st.session_state.now_playing = {
-                            "Song": seed.title,
-                            "Artist": seed.artist,
-                            "video_id": seed.video_id,
-                        }
-
-                parsed = st.session_state.get("_last_parsed_seed", {})
-                seed_video_id = parsed.get("video_id", "")
-
-                if parsed.get("title"):
-                    # Silently use the best-available parse. Any uncertainty
-                    # about the parse is an internal concern, not something
-                    # to surface to a listener who just wants to hear music —
-                    # the "Now Sampling" card below is the single source of
-                    # truth they see.
-                    seed_artist = parsed.get("artist", "")
-                    seed_title = parsed.get("title", "")
-
-                    # Keep the player in sync with whatever we just parsed.
-                    if st.session_state.now_playing and st.session_state.now_playing.get("video_id") == seed_video_id:
-                        st.session_state.now_playing["Song"] = seed_title
-                        st.session_state.now_playing["Artist"] = seed_artist
-
-                elif seed_video_id:
-                    seed_artist = st.text_input("Artist", key="yt_artist_manual", placeholder="e.g. The Weeknd")
-                    seed_title = st.text_input("Track Title", key="yt_title_manual", placeholder="e.g. Blinding Lights")
-                else:
-                    st.caption("That doesn't look like a valid YouTube link. Try pasting the full URL, or switch to Artist + Track.")
-                    seed_artist = st.text_input("Artist", key="yt_artist_manual", placeholder="e.g. The Weeknd")
-                    seed_title = st.text_input("Track Title", key="yt_title_manual", placeholder="e.g. Blinding Lights")
-
-        st.markdown("<hr class='tf-divider'>", unsafe_allow_html=True)
-
-        st.markdown('<div class="tf-card-title">🎛️ Recommendation Controls</div>', unsafe_allow_html=True)
-        num_recs = st.slider(
-            "How many recommendations do you want?",
-            min_value=5,
-            max_value=50,
-            value=5,
-            step=1,
-            help="Scale from a quick 5-track sample to a full 50-track deep dive.",
+    if vault:
+        json_bytes = playlist_to_json_bytes()
+        st.download_button(
+            label="Download Collection",
+            data=json_bytes,
+            file_name="trackfind_collection.json",
+            mime="application/json",
+            use_container_width=True,
         )
-
-        st.markdown(
-            f"""<span class="tf-stat-chip">{num_recs}<span>tracks requested</span></span>""",
-            unsafe_allow_html=True,
-        )
-
-        st.session_state.auto_generate_enabled = st.checkbox(
-            "⚡ Auto-generate as soon as a track is detected or confirmed",
-            value=st.session_state.get("auto_generate_enabled", True),
-            help="When on, recommendations generate automatically — no need to click the button below. Turn off if you'd rather review or edit the artist/title first.",
-        )
-
         st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<div class="tf-primary-btn">', unsafe_allow_html=True)
-        button_label = "🔁 Regenerate Recommendations" if st.session_state.auto_generate_enabled else "✨ Generate Recommendations"
-        generate_clicked = st.button(button_label, use_container_width=True)
+
+    uploaded_vault = st.file_uploader(
+        "Restore a saved collection",
+        label_visibility="collapsed",
+        key="vault_resume_uploader",
+    )
+    if uploaded_vault is not None:
+        already_processed = st.session_state.get("_last_restored_upload_id")
+        upload_id = f"{uploaded_vault.name}_{uploaded_vault.size}"
+        if already_processed != upload_id:
+            success, message = restore_playlist_from_file(uploaded_vault.read(), uploaded_vault.name)
+            st.session_state["_last_restored_upload_id"] = upload_id
+            if success:
+                st.success(message)
+                st.rerun()
+            else:
+                st.error(message)
+
+    # ---- Clear Playlist: single inline "armed" button ----
+    # First click arms it (label changes in place to an urgent confirm
+    # state); a second click while armed purges. Interacting with any
+    # other widget safely disarms it back to idle.
+    #
+    # [BUG FIX] This went through several iterations while testing, worth
+    # documenting since the failure modes were each subtle:
+    #   1. Arm with no rerun: the label only updates on the NEXT click
+    #      (effectively needing three clicks total) since st.button()
+    #      already rendered with the pre-click label by the time the
+    #      click is handled.
+    #   2. Arm + immediate st.rerun(): fixes #1, but creates one "phantom"
+    #      extra script execution that wasn't caused by a fresh click —
+    #      on that exact execution this button reads as not-clicked,
+    #      which (without further care) trips a "something else triggered
+    #      this, disarm" check and silently resets the armed state before
+    #      the user's real second click ever lands.
+    #   3. Tried moving the disarm check to BEFORE the button renders (to
+    #      also fix the label lagging one render behind on a genuine
+    #      disarm-by-other-widget). This broke the two-click confirm
+    #      entirely: that pre-render check can't know whether THIS run's
+    #      upcoming st.button() call will itself return True, so it can't
+    #      distinguish "a different widget triggered this run" from "the
+    #      user is about to click this exact button for the second time" —
+    #      both look identical at that point. It disarmed the second
+    #      click's run before the click was even evaluated.
+    # The fix that actually holds up: NEVER disarm pre-emptively before
+    # st.button() is called. Only disarm reactively, in the branch where
+    # we already know for certain the click result was False. A one-shot
+    # marker, set right before the rerun that follows arming and consumed
+    # on the very next execution, is enough to protect that one specific
+    # phantom run without needing to predict anything about future clicks.
+    # The label lagging one automatic rerun behind a disarm-by-other-widget
+    # is invisible in practice — Streamlit reruns the whole script on every
+    # widget interaction regardless, so it's already correct by the time
+    # of the user's next click, with no extra click required to "catch up".
+    if vault:
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        just_armed_phantom_run = st.session_state.pop("_just_armed_phantom", False)
+
+        is_armed = st.session_state.get("confirm_clear_pending", False)
+        label = "Click Again to Confirm Wiping Playlist" if is_armed else "Clear Playlist"
+        btn_wrapper_class = "tf-armed-btn" if is_armed else ""
+
+        st.markdown(f'<div class="{btn_wrapper_class}">', unsafe_allow_html=True)
+        clear_clicked = st.button(label, use_container_width=True, key="clear_playlist_btn")
         st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown('</div>', unsafe_allow_html=True)  # close tf-card
-
-        # -------------------- GENERATE LOGIC --------------------
-        def run_generation(artist: str, title: str, count: int, video_id: str = ""):
-            """
-            Shared generation routine used by both the manual "✨ Generate
-            Recommendations" button AND the new auto-generate trigger, so
-            the two paths can't drift out of sync.
-            """
-            if not title and not artist:
-                st.error("Please provide at least a track title or artist name before generating recommendations.")
-                return
-            try:
-                with st.spinner(f"🎧 Curating {count} tracks with Gemini AI..."):
-                    results = get_recommendations(artist, title, count)
-                st.session_state.recommendations = results
-                st.session_state.has_generated = True
-                st.session_state.last_seed = {"artist": artist, "title": title}
+        if clear_clicked:
+            if is_armed:
+                st.session_state.playlist_vault = []
+                st.session_state.confirm_clear_pending = False
                 st.session_state.current_queue_index = None
-                st.session_state.now_playing = {
-                    "Song": title,
-                    "Artist": artist,
-                    "video_id": video_id,
-                }
-                model_used = st.session_state.get("working_model", GEMINI_MODEL)
-                st.success(f"🎉 Generated {len(results)} recommendations based on '{title or artist}'!")
-                st.caption(f"Served by `{model_used}`")
-            except RuntimeError as e:
-                st.error(f"⚠️ {e}")
-            except Exception as e:
-                st.error(f"⚠️ Something went wrong while contacting Gemini: {e}")
-
-        # [UX FEATURE] Auto-generate the moment a seed is confirmed — either
-        # a YouTube link finishes parsing, or a Search & Verify candidate is
-        # confirmed — instead of requiring an extra manual button click.
-        # Guarded by a "fingerprint" of the current seed so it only fires
-        # ONCE per new seed, not on every unrelated rerun (e.g. dragging the
-        # slider, or editing the artist/title fields afterward).
-        current_seed_fingerprint = f"{seed_artist}|{seed_title}|{seed_video_id}"
-        should_auto_generate = (
-            (seed_artist or seed_title)
-            and current_seed_fingerprint != st.session_state.get("_last_auto_generated_fingerprint")
-            and st.session_state.get("auto_generate_enabled", True)
-        )
-
-        if should_auto_generate:
-            st.session_state["_last_auto_generated_fingerprint"] = current_seed_fingerprint
-            run_generation(seed_artist, seed_title, num_recs, seed_video_id)
-        elif generate_clicked:
-            run_generation(seed_artist, seed_title, num_recs, seed_video_id)
-
-    # -------------------- RIGHT COLUMN: PLAYBACK PREVIEW --------------------
-    with col_player:
-        st.markdown('<div class="tf-card">', unsafe_allow_html=True)
-        st.markdown('<div class="tf-card-title">▶️ Now Sampling</div>', unsafe_allow_html=True)
-
-        now_playing = st.session_state.now_playing
-        queue_idx = st.session_state.get("current_queue_index")
-        in_queue_mode = queue_idx is not None and 0 <= queue_idx < len(st.session_state.playlist_vault)
-
-        if now_playing and (now_playing.get("Song") or now_playing.get("Artist")):
-            song = now_playing.get("Song", "")
-            artist = now_playing.get("Artist", "")
-            video_id = now_playing.get("video_id", "")
-
-            st.markdown(f"**{song}**")
-            st.markdown(f"<span class='tf-subtle'>{artist}</span>", unsafe_allow_html=True)
-
-            # If we don't already have a confirmed video (e.g. this came from
-            # an AI recommendation or manual typing rather than a pasted
-            # link or confirmed search result), try to auto-resolve a real
-            # one via the YouTube Data API — but only if that optional key
-            # is configured.
-            if not video_id:
-                yt_key = get_youtube_api_key()
-                if yt_key:
-                    query = f"{artist} {song}".strip()
-                    if query:
-                        with st.spinner("Finding video..."):
-                            resolved_id = search_youtube_video_id(query, yt_key)
-                        if resolved_id:
-                            video_id = resolved_id
-                            # Cache the resolution on now_playing so we don't
-                            # re-search on every rerun of the script.
-                            st.session_state.now_playing["video_id"] = resolved_id
-
-            if video_id:
-                # We have a real, confirmed YouTube video — this embeds and
-                # plays directly inline.
-                watch_url = build_youtube_watch_url(video_id)
-                st.video(watch_url, autoplay=True)
-                st.caption("🔊 Now playing.")
+                st.toast("Playlist cleared.")
             else:
-                # No confirmed video and no YouTube key configured (or the
-                # search came up empty) — st.video() cannot play a
-                # search-results page, so offer a clear, honest link instead
-                # of a broken embed.
-                query = f"{artist} {song}".strip()
-                search_url = build_youtube_search_url(query) if query else ""
-                st.markdown(
-                    """
-                    <div class="tf-empty-state" style="padding:1.6rem 1rem;">
-                        <span class="tf-emoji">🔎</span>
-                        No direct video found for this track yet.
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                if search_url:
-                    st.link_button("🔗 Find & play on YouTube", search_url, use_container_width=True)
-                if not get_youtube_api_key():
-                    st.caption("Tip: add a free YOUTUBE_API_KEY to enable automatic inline playback for every recommendation.")
-                else:
-                    st.caption("No matching video was found automatically — try the link above.")
-
-            # [FEATURE] Active Queue Controller — Previous / Next, inline
-            # under the player. Only meaningfully active when the current
-            # track came from the vault queue (clicking ▶️ on a saved track,
-            # or navigating with these same controls); disabled entirely
-            # otherwise since there's no queue context to step through.
-            # Buttons also gray out at the absolute ends of the vault list
-            # so Next/Previous can't run past the boundaries.
-            st.markdown("<br>", unsafe_allow_html=True)
-            vault_len = len(st.session_state.playlist_vault)
-            ctrl_prev, ctrl_next = st.columns(2)
-            with ctrl_prev:
-                st.button(
-                    "⏮️ Previous",
-                    key="player_prev",
-                    use_container_width=True,
-                    disabled=not in_queue_mode or queue_idx == 0,
-                    on_click=queue_play_previous,
-                )
-            with ctrl_next:
-                st.button(
-                    "⏭️ Next",
-                    key="player_next",
-                    use_container_width=True,
-                    disabled=not in_queue_mode or queue_idx == vault_len - 1,
-                    on_click=queue_play_next,
-                )
-            if not in_queue_mode:
-                st.caption("Play a track from your Playlist Vault to enable queue controls.")
-
-            # [FEATURE] Save whatever's currently playing straight to the
-            # vault, without needing to find it again in the recommendations
-            # list below — handy for a track pasted/searched directly, or
-            # one you're sampling that you want to keep regardless of how
-            # it got here.
-            st.markdown("<br>", unsafe_allow_html=True)
-            already_saved = any(
-                t.get("Song", "").lower() == song.lower() and t.get("Artist", "").lower() == artist.lower()
-                for t in st.session_state.playlist_vault
-            )
-            if already_saved:
-                st.button("✅ Already in your Playlist", use_container_width=True, disabled=True, key="add_current_saved")
-            else:
-                if st.button("➕ Add to Playlist", use_container_width=True, key="add_current_to_playlist"):
-                    add_to_playlist({
-                        "Song": song,
-                        "Artist": artist,
-                        "Reason": now_playing.get("Reason", ""),
-                        "video_id": video_id,
-                    })
-                    st.rerun()
+                st.session_state.confirm_clear_pending = True
+                st.session_state["_just_armed_phantom"] = True
+            st.rerun()
         else:
+            # This exact button was NOT the trigger for this run. If it's
+            # the one phantom rerun immediately following our own arming,
+            # leave the armed state alone. Otherwise, some genuinely
+            # different widget caused this rerun — disarm safely.
+            if is_armed and not just_armed_phantom_run:
+                st.session_state.confirm_clear_pending = False
+    elif not vault:
+        st.caption("Add tracks to your collection to unlock backup options.")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ===========================================================================
+# RIGHT COLUMN — DISCOVER + RECOMMENDATION FEED
+# ===========================================================================
+with col_discover:
+
+    # -------------------- DISCOVER --------------------
+    st.markdown('<div class="tf-card">', unsafe_allow_html=True)
+    st.markdown('<div class="tf-card-title">Discover</div>', unsafe_allow_html=True)
+
+    input_mode = st.radio(
+        "Source",
+        options=["Search Song", "Paste a Link"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="input_mode_radio",
+    )
+
+    # Reset the confirmed seed if the user switches input modes, so a
+    # confirmation from one mode doesn't leak into the other.
+    if st.session_state.get("_last_input_mode") != input_mode:
+        st.session_state.confirmed_seed = None
+        st.session_state.search_candidates = []
+        st.session_state.search_performed = False
+        st.session_state["_last_input_mode"] = input_mode
+
+    seed_artist, seed_title = "", ""
+    seed_video_id = ""
+
+    # ===========================================================================
+    # MODE A: Search Song
+    # ===========================================================================
+    if input_mode == "Search Song":
+        c1, c2 = st.columns(2)
+        with c1:
+            typed_artist = st.text_input("Artist", placeholder="The Weeknd", key="typed_artist")
+        with c2:
+            typed_title = st.text_input("Track", placeholder="Blinding Lights", key="typed_title")
+
+        st.markdown('<div class="tf-search-btn">', unsafe_allow_html=True)
+        search_clicked = st.button("Search", use_container_width=True, key="search_track_btn")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        yt_key = get_youtube_api_key()
+
+        # NOTE: `search_clicked` is only True on the exact script run where
+        # the button was pressed — it resets to False on every later rerun
+        # (e.g. when the user types into a fallback confirm field below).
+        # We persist the "a search was performed" state separately so the
+        # results/fallback UI doesn't vanish the instant the user
+        # interacts with anything else on the page.
+        if search_clicked:
+            display_query = f"{typed_artist} {typed_title}".strip()
+            query = build_music_search_query(typed_artist, typed_title)
+            if not query:
+                st.error("Add an artist name or a track title before searching.")
+                st.session_state.search_performed = False
+            else:
+                st.session_state.confirmed_seed = None
+                st.session_state.last_search_query = query
+                st.session_state.last_search_display_query = display_query
+                st.session_state.search_performed = True
+                if yt_key:
+                    with st.spinner("Searching..."):
+                        candidates = search_youtube_tracks(query, yt_key, max_results=5)
+                    st.session_state.search_candidates = candidates
+                else:
+                    # No YouTube key — smart fallback: skip real search,
+                    # treat the typed values as a single confirmable
+                    # candidate so the verification step still exists.
+                    st.session_state.search_candidates = []
+
+        search_performed = st.session_state.get("search_performed", False)
+
+        # ---- Render candidate results (real search) ----
+        if st.session_state.search_candidates:
+            display_query = st.session_state.get("last_search_display_query") or st.session_state.last_search_query
+            st.caption(f"Top matches for \u201c{display_query}\u201d — confirm the exact track:")
+            option_labels = []
+            for cand in st.session_state.search_candidates:
+                option_labels.append(f"{cand['title']}  \u00b7  {cand['channel']}")
+
+            chosen_label = st.radio(
+                "Select the exact track",
+                options=option_labels,
+                label_visibility="collapsed",
+                key="candidate_radio",
+            )
+            chosen_idx = option_labels.index(chosen_label) if chosen_label in option_labels else 0
+            chosen = st.session_state.search_candidates[chosen_idx]
+
             st.markdown(
-                """
-                <div class="tf-empty-state">
-                    <span class="tf-emoji">🎶</span>
-                    Generate recommendations or pick a track below to preview it here.
+                f"""
+                <div class="tf-candidate">
+                    <img src="{chosen['thumbnail']}" alt="">
+                    <div>
+                        <p class="tf-candidate-title">{chosen['title']}</p>
+                        <p class="tf-candidate-channel">{chosen['channel']}</p>
+                    </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-        st.markdown('</div>', unsafe_allow_html=True)
+            if st.button("Confirm Track", use_container_width=True, key="confirm_candidate_btn"):
+                cleaned = clean_youtube_title(chosen["title"])
+                guess = split_artist_title_regex(cleaned)
+                confirmed_artist = guess.artist or typed_artist
+                confirmed_title = guess.title or typed_title or cleaned
+                st.session_state.confirmed_seed = {
+                    "artist": confirmed_artist,
+                    "title": confirmed_title,
+                    "video_id": chosen["video_id"],
+                }
+                # Instant playback the moment a track is confirmed. This
+                # isn't queue playback, so step out of queue mode.
+                st.session_state.current_queue_index = None
+                st.session_state.now_playing = {
+                    "Song": confirmed_title,
+                    "Artist": confirmed_artist,
+                    "video_id": chosen["video_id"],
+                }
+                st.toast(f"Confirmed: {confirmed_title} \u2014 {confirmed_artist}")
+                st.rerun()
 
-    # -------------------- RECOMMENDATIONS LIST --------------------
+        elif search_performed and not yt_key:
+            # Smart fallback when no YOUTUBE_API_KEY is configured: a clean
+            # manual confirmation step instead of real candidates.
+            st.info("Confirm the details below to continue:")
+            fb_artist = st.text_input("Confirm Artist", value=typed_artist, key="fallback_artist")
+            fb_title = st.text_input("Confirm Track", value=typed_title, key="fallback_title")
+            if st.button("Confirm Track", use_container_width=True, key="confirm_fallback_btn"):
+                st.session_state.confirmed_seed = {
+                    "artist": fb_artist,
+                    "title": fb_title,
+                    "video_id": "",
+                }
+                st.session_state.current_queue_index = None
+                st.session_state.now_playing = {
+                    "Song": fb_title,
+                    "Artist": fb_artist,
+                    "video_id": "",
+                }
+                st.session_state.search_performed = False
+                st.toast(f"Confirmed: {fb_title} \u2014 {fb_artist}")
+                st.rerun()
+
+        elif search_performed and yt_key and not st.session_state.search_candidates:
+            st.warning("No matches found. Try simplifying the search, or confirm manually below.")
+            fb_artist = st.text_input("Confirm Artist", value=typed_artist, key="fallback_artist_noresults")
+            fb_title = st.text_input("Confirm Track", value=typed_title, key="fallback_title_noresults")
+            if st.button("Confirm Track", use_container_width=True, key="confirm_fallback_noresults_btn"):
+                st.session_state.confirmed_seed = {
+                    "artist": fb_artist,
+                    "title": fb_title,
+                    "video_id": "",
+                }
+                st.session_state.current_queue_index = None
+                st.session_state.now_playing = {
+                    "Song": fb_title,
+                    "Artist": fb_artist,
+                    "video_id": "",
+                }
+                st.session_state.search_performed = False
+                st.toast(f"Confirmed: {fb_title} \u2014 {fb_artist}")
+                st.rerun()
+
+        # ---- Show current confirmation status ----
+        if st.session_state.confirmed_seed:
+            cs = st.session_state.confirmed_seed
+            st.success(f"Locked in: {cs['title']} \u2014 {cs['artist']}")
+            seed_artist, seed_title = cs["artist"], cs["title"]
+            seed_video_id = cs.get("video_id", "")
+        else:
+            # Allow generating straight from typed fields too (search is a
+            # recommended verification step, not a hard gate).
+            seed_artist, seed_title = typed_artist, typed_title
+            if (typed_artist or typed_title) and not search_performed:
+                st.caption("Tip: search to verify the exact match before finding recommendations.")
+
+    # ===========================================================================
+    # MODE B: Paste a Link
+    # ===========================================================================
+    else:
+        yt_url = st.text_input(
+            "Link",
+            placeholder="https://www.youtube.com/watch?v=...",
+            key="yt_url_input",
+            label_visibility="collapsed",
+        )
+
+        if yt_url:
+            # Only re-parse when the URL actually changes, to avoid
+            # re-fetching/re-parsing on every unrelated widget rerun.
+            if st.session_state.get("_last_parsed_url") != yt_url:
+                with st.spinner("Reading link..."):
+                    seed = parse_youtube_link(yt_url)
+                st.session_state["_last_parsed_seed"] = asdict(seed)
+                st.session_state["_last_parsed_url"] = yt_url
+
+                # Update the player THE MOMENT we have a video_id —
+                # independent of clicking Find Recommendations.
+                if seed.video_id:
+                    st.session_state.current_queue_index = None
+                    st.session_state.now_playing = {
+                        "Song": seed.title,
+                        "Artist": seed.artist,
+                        "video_id": seed.video_id,
+                    }
+
+            parsed = st.session_state.get("_last_parsed_seed", {})
+            seed_video_id = parsed.get("video_id", "")
+
+            if parsed.get("title"):
+                # Silently use the best-available parse. Any uncertainty
+                # about the parse is an internal concern, not something to
+                # surface to a listener who just wants to hear music — the
+                # Now Playing panel is the single source of truth they see.
+                seed_artist = parsed.get("artist", "")
+                seed_title = parsed.get("title", "")
+
+                # Keep the player in sync with whatever we just parsed.
+                if st.session_state.now_playing and st.session_state.now_playing.get("video_id") == seed_video_id:
+                    st.session_state.now_playing["Song"] = seed_title
+                    st.session_state.now_playing["Artist"] = seed_artist
+
+            elif seed_video_id:
+                seed_artist = st.text_input("Artist", key="yt_artist_manual", placeholder="The Weeknd")
+                seed_title = st.text_input("Track", key="yt_title_manual", placeholder="Blinding Lights")
+            else:
+                st.caption("That link couldn't be read. Try pasting the full URL, or use Search Song instead.")
+                seed_artist = st.text_input("Artist", key="yt_artist_manual", placeholder="The Weeknd")
+                seed_title = st.text_input("Track", key="yt_title_manual", placeholder="Blinding Lights")
+
     st.markdown("<hr class='tf-divider'>", unsafe_allow_html=True)
 
+    num_recs = st.slider(
+        "Number of recommendations",
+        min_value=5,
+        max_value=50,
+        value=5,
+        step=1,
+        help="From a quick 5-track sample to a full 50-track deep dive.",
+    )
+
+    st.markdown(
+        f"""<span class="tf-stat-chip">{num_recs}<span>tracks</span></span>""",
+        unsafe_allow_html=True,
+    )
+
+    st.session_state.auto_generate_enabled = st.checkbox(
+        "Find recommendations automatically",
+        value=st.session_state.get("auto_generate_enabled", True),
+        help="When on, recommendations appear automatically as soon as a track is confirmed. Turn off to review the details first.",
+    )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div class="tf-primary-btn">', unsafe_allow_html=True)
+    button_label = "Refresh Recommendations" if st.session_state.auto_generate_enabled else "Find Recommendations"
+    generate_clicked = st.button(button_label, use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('</div>', unsafe_allow_html=True)  # close tf-card
+
+    # -------------------- AUTO-GENERATE TRIGGER --------------------
+    # Fires the moment a seed is confirmed — either a link finishes
+    # parsing, or a Search Song candidate is confirmed — instead of
+    # requiring an extra manual button click. Guarded by a "fingerprint" of
+    # the current seed so it only fires ONCE per new seed, not on every
+    # unrelated rerun (e.g. dragging the slider afterward).
+    current_seed_fingerprint = f"{seed_artist}|{seed_title}|{seed_video_id}"
+    should_auto_generate = (
+        (seed_artist or seed_title)
+        and current_seed_fingerprint != st.session_state.get("_last_auto_generated_fingerprint")
+        and st.session_state.get("auto_generate_enabled", True)
+    )
+
+    if should_auto_generate:
+        st.session_state["_last_auto_generated_fingerprint"] = current_seed_fingerprint
+        run_generation(seed_artist, seed_title, num_recs, seed_video_id)
+    elif generate_clicked:
+        run_generation(seed_artist, seed_title, num_recs, seed_video_id)
+
+    # -------------------- RECOMMENDATION FEED --------------------
     if st.session_state.recommendations:
-        st.markdown('<div class="tf-card-title" style="font-size:1rem;">🪄 Curated For You</div>', unsafe_allow_html=True)
+        st.markdown('<div class="tf-card-title" style="font-size:0.85rem; margin-top:0.4rem;">For You</div>', unsafe_allow_html=True)
 
         for idx, track in enumerate(st.session_state.recommendations):
             song = track.get("Song", "Unknown Track")
             artist = track.get("Artist", "Unknown Artist")
-            reason = track.get("Reason", "")
+            attributes = get_track_attributes(track)
+            pills_html = "".join(f'<span class="tf-attr-pill">{a}</span>' for a in attributes)
 
             row = st.container()
             with row:
@@ -2040,211 +2204,40 @@ with tab_discover:
                 with c_info:
                     st.markdown(
                         f"""
-                        <div class="tf-track">
-                            <span class="tf-badge">#{idx + 1}</span>
-                            <p class="tf-track-song">{song}</p>
-                            <p class="tf-track-artist">{artist}</p>
-                            <p class="tf-track-reason">💡 {reason}</p>
+                        <div class="tf-feed-row">
+                            <span class="tf-index-badge">#{idx + 1}</span>
+                            <p class="tf-feed-song">{song}</p>
+                            <p class="tf-feed-artist">{artist}</p>
+                            <div class="tf-pill-row">{pills_html}</div>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
                 with c_play:
-                    if st.button("▶️ Play", key=f"play_{idx}"):
+                    if st.button("Play", key=f"play_{idx}"):
                         st.session_state.current_queue_index = None
-                        st.session_state.now_playing = {"Song": song, "Artist": artist, "video_id": ""}
+                        st.session_state.now_playing = {
+                            "Song": song,
+                            "Artist": artist,
+                            "video_id": "",
+                            "MatchingAttributes": attributes,
+                        }
                         st.rerun()
                 with c_add:
-                    if st.button("➕ Add to Playlist", key=f"add_{idx}"):
-                        add_to_playlist({"Song": song, "Artist": artist, "Reason": reason})
+                    if st.button("Add", key=f"add_{idx}"):
+                        add_to_playlist({"Song": song, "Artist": artist, "MatchingAttributes": attributes})
 
     elif st.session_state.has_generated:
-        st.info("No recommendations were returned. Try a different seed track.")
+        st.info("No recommendations came back. Try a different track.")
     else:
         st.markdown(
             """
             <div class="tf-empty-state">
-                <span class="tf-emoji">🧭</span>
-                Your recommendations will appear here once you generate them above.
+                Your recommendations will appear here once you find them above.
             </div>
             """,
             unsafe_allow_html=True,
         )
-
-
-# ---------------------------------------------------------------------------
-# TAB 2: MY PLAYLIST VAULT
-# ---------------------------------------------------------------------------
-with tab_vault:
-    vault = st.session_state.playlist_vault
-
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        st.markdown(
-            f"""<span class="tf-stat-chip">{len(vault)}<span>saved tracks</span></span>""",
-            unsafe_allow_html=True,
-        )
-    with col_b:
-        unique_artists = len({t["Artist"] for t in vault}) if vault else 0
-        st.markdown(
-            f"""<span class="tf-stat-chip">{unique_artists}<span>unique artists</span></span>""",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<hr class='tf-divider'>", unsafe_allow_html=True)
-
-    # -------------------- 🎧 PLAYLIST PLAYBACK BAR --------------------
-    queue_idx = st.session_state.get("current_queue_index")
-    if vault and queue_idx is not None and 0 <= queue_idx < len(vault):
-        active_track = vault[queue_idx]
-
-        st.markdown('<div class="tf-playback-bar">', unsafe_allow_html=True)
-        bar_info_col, bar_controls_col = st.columns([2, 1])
-        with bar_info_col:
-            st.markdown(
-                f"""
-                <div class="tf-playback-bar-info">
-                    <span class="tf-playback-bar-label">🎧 Now in Queue · Track {queue_idx + 1} of {len(vault)}</span>
-                    <span class="tf-playback-bar-track">{active_track.get('Song','')}</span>
-                    <span class="tf-playback-bar-artist">{active_track.get('Artist','')}</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with bar_controls_col:
-            bar_prev, bar_next = st.columns(2)
-            with bar_prev:
-                if st.button("⏮️", key="bar_prev", help="Previous track", use_container_width=True, disabled=(queue_idx == 0)):
-                    queue_play_previous()
-                    st.rerun()
-            with bar_next:
-                if st.button("⏭️", key="bar_next", help="Next track", use_container_width=True, disabled=(queue_idx == len(vault) - 1)):
-                    queue_play_next()
-                    st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
-    elif vault:
-        st.caption("💡 Tip: click ▶️ on any saved track below to start your queue, then use the Previous/Next controls on the player.")
-
-    col_list, col_export = st.columns([1.4, 1], gap="large")
-
-    # -------------------- SAVED TRACKS LIST --------------------
-    with col_list:
-        st.markdown('<div class="tf-card">', unsafe_allow_html=True)
-        st.markdown('<div class="tf-card-title">💾 Saved Tracks</div>', unsafe_allow_html=True)
-
-        if not vault:
-            st.markdown(
-                """
-                <div class="tf-empty-state">
-                    <span class="tf-emoji">📭</span>
-                    Your vault is empty. Head to "Discover &amp; Sync" and add some tracks!
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            for i, track in enumerate(vault):
-                is_current = st.session_state.get("current_queue_index") == i
-                r1, r2, r3, r4, r5 = st.columns([3.6, 0.7, 0.55, 0.55, 0.7])
-                with r1:
-                    link = track.get("youtube_url", "")
-                    link_html = f'<a href="{link}" target="_blank" style="color:#6EE7B7; font-size:0.78rem; text-decoration:none;">🔗 YouTube</a>' if link else ""
-                    now_playing_badge = (
-                        ' <span class="tf-badge" style="margin-bottom:0;">▶ Playing</span>' if is_current else ""
-                    )
-                    row_class = "tf-vault-row tf-vault-row-active" if is_current else "tf-vault-row"
-                    st.markdown(
-                        f"""
-                        <div class="{row_class}">
-                            <div>
-                                <span class="tf-vault-title">{track.get('Song','')}</span>{now_playing_badge}<br>
-                                <span class="tf-vault-artist">{track.get('Artist','')}</span> {link_html}
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                with r2:
-                    if st.button("▶️", key=f"vault_play_{i}", help="Play this track"):
-                        load_queue_track(i)
-                        st.toast("Switched preview — check the Discover tab. 🎧")
-                        st.rerun()
-                with r3:
-                    if st.button("🔼", key=f"vault_up_{i}", help="Move up", disabled=(i == 0)):
-                        move_track_in_vault(i, -1)
-                        st.rerun()
-                with r4:
-                    if st.button("🔽", key=f"vault_down_{i}", help="Move down", disabled=(i == len(vault) - 1)):
-                        move_track_in_vault(i, 1)
-                        st.rerun()
-                with r5:
-                    if st.button("🗑️", key=f"vault_remove_{i}", help="Remove from vault"):
-                        remove_from_playlist(i)
-                        st.rerun()
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # -------------------- PLAYLIST DOWNLOAD, RESUME & MANAGE --------------------
-    with col_export:
-        st.markdown('<div class="tf-card">', unsafe_allow_html=True)
-        st.markdown('<div class="tf-card-title">💾 Save &amp; Resume Later</div>', unsafe_allow_html=True)
-        st.caption("No account needed — download your playlist now, and upload it next time to pick up right where you left off.")
-
-        if vault:
-            json_bytes = playlist_to_json_bytes()
-            st.download_button(
-                label="⬇️ Download Playlist",
-                data=json_bytes,
-                file_name="trackfind_playlist.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-            st.markdown("<br>", unsafe_allow_html=True)
-
-        uploaded_vault = st.file_uploader(
-            "Resume a saved playlist",
-            label_visibility="collapsed",
-            key="vault_resume_uploader",
-        )
-        if uploaded_vault is not None:
-            already_processed = st.session_state.get("_last_restored_upload_id")
-            upload_id = f"{uploaded_vault.name}_{uploaded_vault.size}"
-            if already_processed != upload_id:
-                success, message = restore_playlist_from_file(uploaded_vault.read(), uploaded_vault.name)
-                st.session_state["_last_restored_upload_id"] = upload_id
-                if success:
-                    st.success(f"✅ {message}")
-                    st.rerun()
-                else:
-                    st.error(f"⚠️ {message}")
-
-        if vault:
-            st.markdown("<br>", unsafe_allow_html=True)
-            # [UX] Single button, ask-on-click instead of a checkbox +
-            # permanently-disabled button. First click arms a confirmation
-            # prompt; a second click on the confirm button actually clears.
-            # Clicking anything else cancels the pending confirmation.
-            if st.session_state.get("confirm_clear_pending"):
-                st.warning("Clear your entire playlist? This can't be undone.")
-                cc1, cc2 = st.columns(2)
-                with cc1:
-                    if st.button("✅ Yes, clear it", use_container_width=True, key="clear_playlist_confirm_yes"):
-                        st.session_state.playlist_vault = []
-                        st.session_state.confirm_clear_pending = False
-                        st.toast("Playlist cleared. Fresh start! 🌱")
-                        st.rerun()
-                with cc2:
-                    if st.button("Cancel", use_container_width=True, key="clear_playlist_confirm_no"):
-                        st.session_state.confirm_clear_pending = False
-                        st.rerun()
-            else:
-                if st.button("🧹 Clear Playlist", use_container_width=True, key="clear_playlist_btn"):
-                    st.session_state.confirm_clear_pending = True
-                    st.rerun()
-        elif not vault:
-            st.caption("Add tracks to your playlist to unlock download options.")
-
-        st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ===========================================================================
@@ -2252,8 +2245,8 @@ with tab_vault:
 # ===========================================================================
 st.markdown(
     """
-    <div style="text-align:center; padding: 1.5rem 0 0.5rem 0; color:#5C7A73; font-size:0.78rem;">
-        Built with Streamlit &amp; Google Gemini · TrackFind © 2026
+    <div style="text-align:center; padding: 1.2rem 0 0.4rem 0; color:#5C7A73; font-size:0.76rem;">
+        TrackFind
     </div>
     """,
     unsafe_allow_html=True,
