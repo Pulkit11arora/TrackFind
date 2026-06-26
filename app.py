@@ -1369,6 +1369,49 @@ def remove_from_playlist(index: int):
         st.toast(f"Removed '{removed['Song']}' from your vault.", icon="🗑️")
 
 
+def _parse_csv_tracks(text: str) -> Optional[List[dict]]:
+    """
+    Parses a CSV file into track dicts, tolerant of both TrackFind's own
+    exported format (Song, Artist, Reason, YouTube Link) and a minimal
+    user-edited CSV that only has Song/Artist columns. Column names are
+    matched case-insensitively. Returns None if the file doesn't look like
+    a track list at all (no recognizable Song/Artist columns).
+    """
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+    except Exception:
+        return None
+
+    if not reader.fieldnames:
+        return None
+
+    normalized = {f.strip().lower(): f for f in reader.fieldnames if f}
+    song_key = normalized.get("song")
+    artist_key = normalized.get("artist")
+    if not song_key or not artist_key:
+        return None
+
+    reason_key = normalized.get("reason")
+    link_key = normalized.get("youtube link") or normalized.get("youtube_url") or normalized.get("link")
+
+    tracks = []
+    for row in reader:
+        song = (row.get(song_key) or "").strip()
+        artist = (row.get(artist_key) or "").strip()
+        if not song:
+            continue
+        track = {
+            "Song": song,
+            "Artist": artist,
+            "Reason": (row.get(reason_key) or "").strip() if reason_key else "",
+        }
+        link = (row.get(link_key) or "").strip() if link_key else ""
+        if link:
+            track["youtube_url"] = link
+        tracks.append(track)
+    return tracks
+
+
 def playlist_to_csv_bytes() -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
@@ -1409,20 +1452,44 @@ def playlist_to_json_bytes() -> bytes:
     return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
 
 
-def restore_playlist_from_json(uploaded_bytes: bytes) -> tuple[bool, str]:
+def restore_playlist_from_file(uploaded_bytes: bytes, filename: str = "") -> tuple[bool, str]:
     """
-    Parses a previously-exported JSON file and restores it into the current
-    session's vault (merging with, not replacing, anything already saved —
-    duplicates by Song+Artist are skipped). Returns (success, message).
-    """
-    try:
-        data = json.loads(uploaded_bytes.decode("utf-8"))
-    except Exception:
-        return False, "That doesn't look like a valid TrackFind export file."
+    [BUG FIX] Previously, the app offered a "Download CSV" button but the
+    resume uploader only accepted .json — so a user who downloaded the CSV
+    (the more prominent of the two export buttons) had no way to bring it
+    back in. This now accepts EITHER format: JSON (TrackFind's own
+    full-fidelity export) or CSV (TrackFind's export, or even a minimal
+    user-edited Song/Artist CSV), auto-detecting which one was uploaded.
 
-    tracks = data.get("playlist_vault")
-    if not isinstance(tracks, list):
-        return False, "This file doesn't contain a recognizable playlist."
+    Merges with, rather than replaces, anything already in the vault —
+    duplicates by Song+Artist are skipped. Returns (success, message).
+    """
+    text = None
+    try:
+        text = uploaded_bytes.decode("utf-8")
+    except Exception:
+        pass
+
+    tracks = None
+    looks_like_json = filename.lower().endswith(".json") or (text and text.strip().startswith("{"))
+
+    if looks_like_json:
+        try:
+            data = json.loads(text)
+            candidate = data.get("playlist_vault")
+            if isinstance(candidate, list):
+                tracks = candidate
+        except Exception:
+            tracks = None
+
+    if tracks is None and text is not None:
+        # Either it wasn't JSON, or the JSON didn't have the expected shape
+        # — try CSV next regardless of the looks_like_json guess, since a
+        # misnamed file should still work if its actual content parses.
+        tracks = _parse_csv_tracks(text)
+
+    if tracks is None:
+        return False, "That doesn't look like a TrackFind playlist file (expected a .csv or .json export)."
 
     existing = {(t.get("Song", "").lower(), t.get("Artist", "").lower()) for t in st.session_state.playlist_vault}
     added = 0
@@ -1975,6 +2042,7 @@ with tab_vault:
                 mime="text/csv",
                 use_container_width=True,
             )
+            st.caption("This CSV can also be re-uploaded later in the \"Save & Resume\" section below.")
 
             st.markdown("<br>", unsafe_allow_html=True)
             st.caption("Copy-paste tracklist:")
@@ -1999,7 +2067,7 @@ with tab_vault:
         # -------------------- SAVE & RESUME (no login required) --------------------
         st.markdown('<div class="tf-card">', unsafe_allow_html=True)
         st.markdown('<div class="tf-card-title">💾 Save &amp; Resume Later</div>', unsafe_allow_html=True)
-        st.caption("No account needed — download your vault now, and upload it next time to pick up right where you left off.")
+        st.caption("No account needed — download your vault now (CSV or the full-fidelity JSON), and upload either one next time to pick up right where you left off.")
 
         if vault:
             json_bytes = playlist_to_json_bytes()
@@ -2014,7 +2082,7 @@ with tab_vault:
 
         uploaded_vault = st.file_uploader(
             "Resume from a saved vault file",
-            type=["json"],
+            type=["json", "csv"],
             label_visibility="collapsed",
             key="vault_resume_uploader",
         )
@@ -2022,7 +2090,7 @@ with tab_vault:
             already_processed = st.session_state.get("_last_restored_upload_id")
             upload_id = f"{uploaded_vault.name}_{uploaded_vault.size}"
             if already_processed != upload_id:
-                success, message = restore_playlist_from_json(uploaded_vault.read())
+                success, message = restore_playlist_from_file(uploaded_vault.read(), uploaded_vault.name)
                 st.session_state["_last_restored_upload_id"] = upload_id
                 if success:
                     st.success(f"✅ {message}")
