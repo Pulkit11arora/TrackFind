@@ -21,109 +21,6 @@ Deploy on Streamlit Community Cloud:
            # https://console.cloud.google.com/ (enable "YouTube Data API
            # v3", then create an API key).
            YOUTUBE_API_KEY = "your-youtube-key-here"
-
-CHANGELOG (this revision — B2C streaming workspace overhaul):
-    [UX OVERHAUL] Removed st.tabs entirely. Single-page workspace using
-              st.columns([1.1, 1.4]): the player and queue ("Up Next") live
-              permanently on the left; discovery and the recommendation
-              feed live on the right. Collapses to a clean vertical stack
-              on narrow/mobile viewports automatically (Streamlit's default
-              column behavior below its mobile breakpoint).
-    [DATA MODEL] RecommendedTrack.Reason (a single free-text sentence) is
-              replaced by MatchingAttributes: List[str] — exactly 3 short
-              categorical tags (e.g. "Sonic Match", "Tempo Sync", "90s
-              Nostalgia"). Rendered as inline pill badges instead of a
-              sentence. Older saved/backed-up tracks that still have a
-              legacy "Reason" string are read gracefully (shown as a single
-              pill) rather than breaking on restore.
-    [COPY]    Renamed throughout: "Seed Track Input" -> "Discover", "Choose
-              input method" -> "Source", "Artist + Track" -> "Search Song",
-              "My Playlist Vault" -> "Up Next", "Save & Resume Later" ->
-              "Backup Session". Removed casual/developer-facing emoji and
-              jargon from labels, placeholders, and button copy throughout.
-    [UX]      Clear Playlist is now a single inline "armed" button: first
-              click changes its own label in place to a visually urgent
-              confirm state; a second click purges. Interacting with any
-              other widget disarms it automatically (this falls out of how
-              Streamlit's st.button() return value already works — no
-              extra plumbing needed).
-    [CARRIED FORWARD] Continuous queue indexing (Next/Previous, drag-free
-              reorder, index-follows-track-not-slot on reorder/delete),
-              tiered YouTube title parsing (regex -> description-label
-              extraction -> Gemini fallback), Gemini model fallback chain,
-              JSON backup/resume, and the full dark/emerald custom theme
-              all carry forward unchanged in behavior.
-
-CHANGELOG (this revision — alignment, responsive, and parsing fixes):
-    [BRANDING] The headphone icon now sits beside the title/tagline as a
-              proper logo mark, sized to roughly match their combined
-              height, instead of being inline emoji text on the title row.
-              Renamed "Up Next" -> "Playlist" across every live section
-              header, button, toast, and caption (history kept in the
-              changelog above). Rewrote the empty-collection and Now
-              Playing onboarding copy to plain, concise instructions.
-    [BUG FIX] Pasting a YouTube link now calls st.rerun() immediately after
-              a brand-new link finishes parsing. col_queue (the player) is
-              declared and executes BEFORE col_discover (where the link is
-              parsed) in script order, so without forcing another pass the
-              new video only appeared once some unrelated widget (e.g. the
-              slider) triggered the next rerun.
-    [BUG FIX] Fixed a real, hard-to-isolate state-desync bug: any
-              st.rerun() triggered from inside col_queue (Add to Playlist,
-              queue navigation, Clear Playlist, restoring a backup) cuts
-              the script short before col_discover's Source radio has run
-              at all on that pass, and Streamlit can silently reset that
-              not-yet-rendered widget to its declared default on the next
-              pass — even though the user never touched it. Fixed with a
-              "did col_discover complete cleanly last pass" flag, checked
-              and reset at the very top of the script (before either
-              column runs) and only set True at col_discover's true end —
-              this restores the radio's correct value exactly when the
-              previous pass was cut short, and never when the user
-              genuinely clicked the radio itself.
-    [BUG FIX] The backup/restore file uploader is now restricted to .json
-              via type=["json"], shows a toast instead of a banner on
-              success, resets the auto-generate fingerprint so stale state
-              from before the restore doesn't linger, and still performs
-              an immediate st.rerun() so the restored collection appears
-              right away.
-    [MOBILE LAYOUT] Each compact playlist row (thumbnail, title/artist,
-              and the four action buttons) now uses
-              st.container(horizontal=True) instead of st.columns.
-              st.columns forces its children to stack vertically below
-              Streamlit's mobile breakpoint with no supported override,
-              which broke each row into six separate stacked lines on a
-              phone. Horizontal containers size each child to its own
-              content instead of dividing the width into fixed
-              proportions, and don't carry that same forced-stack
-              behavior, so the row stays compact and horizontal at any
-              viewport width. The track/artist stat chips are now rendered
-              as a single inline flex row for the same reason.
-    [UX] The Previous/Next queue controls and their helper caption are now
-              hidden entirely (not just disabled) when
-              current_queue_index is None, instead of always rendering in
-              a grayed-out state with no active queue context.
-
-CHANGELOG (this revision — backup uploader state-sync fixes):
-    [BUG FIX] A successful restore now shows a one-shot "Success: Loaded N
-              tracks into your session!" banner right above the uploader,
-              cleared after a single render so it never lingers. Without
-              this, the uploader kept showing the picked filename and the
-              collection stats updated silently underneath it, which could
-              look like nothing had happened even though the restore
-              worked.
-    [BUG FIX] The uploader's key is now driven by a monotonically
-              increasing "uploader_epoch" counter (advanced on every
-              successful restore AND every Clear Playlist action) instead
-              of a fixed key. This gives the widget a genuinely fresh
-              identity each time — note this is deliberately a counter,
-              not a key derived from collection length, since length can
-              cycle back to a previously-seen value (e.g. clear then
-              re-upload), which would reintroduce the exact "same file
-              silently ignored" bug this was meant to fix. Clearing the
-              playlist also resets the upload-dedup marker, so a backup
-              file that was already restored once can be uploaded again
-              immediately afterward without a hard browser refresh.
 """
 
 import os
@@ -1724,7 +1621,7 @@ def run_generation(artist: str, title: str, count: int, video_id: str = ""):
             "Artist": artist,
             "video_id": video_id,
         }
-        st.success(f"Found {len(results)} tracks based on '{title or artist}'.")
+        st.success(f"Found {len(results)} song recommendations based on the searched song.")
     except RuntimeError as e:
         st.error(str(e))
     except Exception as e:
