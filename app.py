@@ -53,6 +53,56 @@ CHANGELOG (this revision — B2C streaming workspace overhaul):
               extraction -> Gemini fallback), Gemini model fallback chain,
               JSON backup/resume, and the full dark/emerald custom theme
               all carry forward unchanged in behavior.
+
+CHANGELOG (this revision — alignment, responsive, and parsing fixes):
+    [BRANDING] The headphone icon now sits beside the title/tagline as a
+              proper logo mark, sized to roughly match their combined
+              height, instead of being inline emoji text on the title row.
+              Renamed "Up Next" -> "Playlist" across every live section
+              header, button, toast, and caption (history kept in the
+              changelog above). Rewrote the empty-collection and Now
+              Playing onboarding copy to plain, concise instructions.
+    [BUG FIX] Pasting a YouTube link now calls st.rerun() immediately after
+              a brand-new link finishes parsing. col_queue (the player) is
+              declared and executes BEFORE col_discover (where the link is
+              parsed) in script order, so without forcing another pass the
+              new video only appeared once some unrelated widget (e.g. the
+              slider) triggered the next rerun.
+    [BUG FIX] Fixed a real, hard-to-isolate state-desync bug: any
+              st.rerun() triggered from inside col_queue (Add to Playlist,
+              queue navigation, Clear Playlist, restoring a backup) cuts
+              the script short before col_discover's Source radio has run
+              at all on that pass, and Streamlit can silently reset that
+              not-yet-rendered widget to its declared default on the next
+              pass — even though the user never touched it. Fixed with a
+              "did col_discover complete cleanly last pass" flag, checked
+              and reset at the very top of the script (before either
+              column runs) and only set True at col_discover's true end —
+              this restores the radio's correct value exactly when the
+              previous pass was cut short, and never when the user
+              genuinely clicked the radio itself.
+    [BUG FIX] The backup/restore file uploader is now restricted to .json
+              via type=["json"], shows a toast instead of a banner on
+              success, resets the auto-generate fingerprint so stale state
+              from before the restore doesn't linger, and still performs
+              an immediate st.rerun() so the restored collection appears
+              right away.
+    [MOBILE LAYOUT] Each compact playlist row (thumbnail, title/artist,
+              and the four action buttons) now uses
+              st.container(horizontal=True) instead of st.columns.
+              st.columns forces its children to stack vertically below
+              Streamlit's mobile breakpoint with no supported override,
+              which broke each row into six separate stacked lines on a
+              phone. Horizontal containers size each child to its own
+              content instead of dividing the width into fixed
+              proportions, and don't carry that same forced-stack
+              behavior, so the row stays compact and horizontal at any
+              viewport width. The track/artist stat chips are now rendered
+              as a single inline flex row for the same reason.
+    [UX] The Previous/Next queue controls and their helper caption are now
+              hidden entirely (not just disabled) when
+              current_queue_index is None, instead of always rendering in
+              a grayed-out state with no active queue context.
 """
 
 import os
@@ -234,6 +284,23 @@ CUSTOM_CSS = """
         background: radial-gradient(circle, rgba(16,185,129,0.35), transparent 70%);
         filter: blur(10px);
     }
+    /* Logo lockup: a large headphone glyph sized to roughly match the
+       combined height of the title + tagline stack beside it, so it reads
+       as a logo mark rather than a decorative emoji. */
+    .tf-hero-lockup {
+        display: flex;
+        align-items: center;
+        gap: 0.85rem;
+        position: relative;
+        z-index: 1;
+    }
+    .tf-hero-logo-icon {
+        font-size: 2.7rem;
+        line-height: 1;
+        flex-shrink: 0;
+        filter: drop-shadow(0 0 14px rgba(16,185,129,0.45));
+    }
+    .tf-hero-text-stack { display: flex; flex-direction: column; justify-content: center; }
     .tf-hero-title {
         font-family: 'Space Grotesk', sans-serif;
         font-size: 1.7rem;
@@ -243,12 +310,14 @@ CUSTOM_CSS = """
         background: linear-gradient(90deg, #34d399 0%, #a7f3d0 50%, #6ee7b7 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
+        line-height: 1.15;
     }
     .tf-hero-tagline {
         margin: 0.2rem 0 0 0;
         color: #9CB8B0;
         font-size: 0.92rem;
         font-weight: 400;
+        line-height: 1.2;
     }
 
     /* ---------- Section / Card Containers ---------- */
@@ -327,7 +396,7 @@ CUSTOM_CSS = """
         text-transform: uppercase;
     }
 
-    /* ---------- Compact Collection Row (Up Next) ---------- */
+    /* ---------- Compact Collection Row (Playlist) ---------- */
     .tf-collection-row {
         background: rgba(255,255,255,0.025);
         border: 1px solid rgba(255,255,255,0.06);
@@ -665,6 +734,7 @@ def init_session_state():
         "_last_restored_upload_id": None,  # guards against re-importing the same backup file every rerun
         "current_queue_index": None,    # index into playlist_vault for Next/Previous — None when playback isn't sourced from the queue
         "confirm_clear_pending": False,  # tracks the single-click-then-confirm flow for Clear Playlist
+        "_col_discover_completed_last_pass": True,  # tracks whether col_discover finished cleanly last pass, for the radio-restoration fix
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1195,7 +1265,7 @@ def build_youtube_thumbnail_url(video_id: str) -> str:
     """
     YouTube thumbnails follow a predictable URL pattern keyed only on the
     video ID — no API call needed. Used for the compact rounded-square
-    thumbnails in the "Up Next" collection rows.
+    thumbnails in the "Playlist" collection rows.
     """
     return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
 
@@ -1386,9 +1456,12 @@ def render_hero():
     st.markdown(
         f"""
         <div class="tf-hero">
-            <div>
-                <p class="tf-hero-title">{APP_TITLE}</p>
-                <p class="tf-hero-tagline">{APP_TAGLINE}</p>
+            <div class="tf-hero-lockup">
+                <span class="tf-hero-logo-icon">\U0001F3A7</span>
+                <div class="tf-hero-text-stack">
+                    <p class="tf-hero-title">{APP_TITLE}</p>
+                    <p class="tf-hero-tagline">{APP_TAGLINE}</p>
+                </div>
             </div>
         </div>
         """,
@@ -1398,7 +1471,7 @@ def render_hero():
 
 def add_to_playlist(track: dict):
     """
-    Adds a track to the collection ("Up Next"). Resolves a real YouTube
+    Adds a track to the collection ("Playlist"). Resolves a real YouTube
     link and a thumbnail at save-time so the compact collection rows and
     any backup export always have a playable URL and a real image.
     """
@@ -1422,7 +1495,7 @@ def add_to_playlist(track: dict):
             track["thumbnail_url"] = ""
 
         st.session_state.playlist_vault.append(track)
-        st.toast(f"Added \u2018{track['Song']}\u2019 to Up Next")
+        st.toast(f"Added \u2018{track['Song']}\u2019 to your playlist")
     else:
         st.toast(f"\u2018{track['Song']}\u2019 is already in your collection")
 
@@ -1576,10 +1649,32 @@ render_hero()
 # ===========================================================================
 # 10. SINGLE-PAGE STREAMING WORKSPACE (no tabs)
 # ===========================================================================
-# LEFT  (narrower, 1.1): the player + the active queue ("Up Next") + backup.
+# LEFT  (narrower, 1.1): the player + the active queue ("Playlist") + backup.
 # RIGHT (wider,   1.4): discovery input + controls + the recommendation feed.
 # On narrow/mobile viewports these stack vertically (Streamlit's default
 # column behavior below its mobile breakpoint) with the player/queue first.
+
+# [BUG FIX SUPPORT] Several actions in col_queue (Add to Playlist, queue
+# navigation, Clear Playlist, restoring a backup) call st.rerun() to
+# reflect state changes immediately. Because col_queue is declared and
+# executed BEFORE col_discover, any one of those reruns interrupts the
+# script before col_discover's Source radio has run at all on that exact
+# pass — and Streamlit can lose track of that not-yet-rendered widget's
+# intended value across the interruption, silently resetting it to its
+# declared default on the next pass.
+#
+# To detect this without ever second-guessing a genuine fresh click on the
+# radio itself, col_discover marks its OWN clean completion at its very
+# end. Here, at the true top of the script — before col_queue or
+# col_discover have run at all this pass — we read whatever that flag was
+# left at by the END of the PREVIOUS pass, then immediately reset it. If
+# the previous pass completed col_discover cleanly, this reads True and
+# nothing needs restoring. If the previous pass was cut short by a rerun
+# from inside col_queue before ever reaching the end of col_discover, this
+# reads False — the one specific signal col_discover needs to safely
+# restore its radio, without ever interfering with a real click on it.
+PREVIOUS_PASS_COMPLETED_DISCOVER = st.session_state.get("_col_discover_completed_last_pass", True)
+st.session_state["_col_discover_completed_last_pass"] = False
 
 col_queue, col_discover = st.columns([1.1, 1.4], gap="large")
 
@@ -1668,31 +1763,33 @@ with col_queue:
                 st.caption("Add a YOUTUBE_API_KEY to enable automatic playback for every recommendation.")
 
         # Queue controller — Previous / Next, inline under the player. Only
-        # meaningfully active when the current track came from the queue
-        # (clicking play on a saved track, or navigating with these same
-        # controls); disabled entirely otherwise since there's no queue
-        # context to step through. Buttons gray out at the absolute ends.
-        st.markdown("<br>", unsafe_allow_html=True)
-        vault_len = len(st.session_state.playlist_vault)
-        ctrl_prev, ctrl_next = st.columns(2)
-        with ctrl_prev:
-            st.button(
-                "Previous",
-                key="player_prev",
-                use_container_width=True,
-                disabled=not in_queue_mode or queue_idx == 0,
-                on_click=queue_play_previous,
-            )
-        with ctrl_next:
-            st.button(
-                "Next",
-                key="player_next",
-                use_container_width=True,
-                disabled=not in_queue_mode or queue_idx == vault_len - 1,
-                on_click=queue_play_next,
-            )
-        if not in_queue_mode:
-            st.caption("Play a track from Up Next to enable queue controls.")
+        # rendered at all when a track is actively initialized from the
+        # playlist queue (current_queue_index is not None) — there's no
+        # queue context to step through otherwise, so showing disabled
+        # buttons and an explanatory caption just adds visual noise for
+        # something that isn't relevant yet (e.g. sampling a fresh
+        # recommendation or a pasted link). Buttons still gray out
+        # individually at the absolute ends of the playlist once shown.
+        if in_queue_mode:
+            st.markdown("<br>", unsafe_allow_html=True)
+            vault_len = len(st.session_state.playlist_vault)
+            ctrl_prev, ctrl_next = st.columns(2)
+            with ctrl_prev:
+                st.button(
+                    "Previous",
+                    key="player_prev",
+                    use_container_width=True,
+                    disabled=queue_idx == 0,
+                    on_click=queue_play_previous,
+                )
+            with ctrl_next:
+                st.button(
+                    "Next",
+                    key="player_next",
+                    use_container_width=True,
+                    disabled=queue_idx == vault_len - 1,
+                    on_click=queue_play_next,
+                )
 
         # Save whatever's currently playing straight to the collection,
         # without needing to find it again in the feed.
@@ -1702,9 +1799,9 @@ with col_queue:
             for t in st.session_state.playlist_vault
         )
         if already_saved:
-            st.button("Already in Up Next", use_container_width=True, disabled=True, key="add_current_saved")
+            st.button("Already in Playlist", use_container_width=True, disabled=True, key="add_current_saved")
         else:
-            if st.button("Add to Up Next", use_container_width=True, key="add_current_to_playlist"):
+            if st.button("Add to Playlist", use_container_width=True, key="add_current_to_playlist"):
                 add_to_playlist({
                     "Song": song,
                     "Artist": artist,
@@ -1716,7 +1813,7 @@ with col_queue:
         st.markdown(
             """
             <div class="tf-empty-state">
-                Find recommendations or pick a track from Up Next to start listening.
+                Search for a song or paste a video link to begin, or upload a backup playlist.
             </div>
             """,
             unsafe_allow_html=True,
@@ -1726,22 +1823,20 @@ with col_queue:
 
     # -------------------- UP NEXT (collection / continuous queue) --------------------
     st.markdown('<div class="tf-card">', unsafe_allow_html=True)
-    st.markdown('<div class="tf-card-title">Up Next</div>', unsafe_allow_html=True)
+    st.markdown('<div class="tf-card-title">Playlist</div>', unsafe_allow_html=True)
 
     vault = st.session_state.playlist_vault
 
-    stat_a, stat_b = st.columns(2)
-    with stat_a:
-        st.markdown(
-            f"""<span class="tf-stat-chip">{len(vault)}<span>tracks</span></span>""",
-            unsafe_allow_html=True,
-        )
-    with stat_b:
-        unique_artists = len({t["Artist"] for t in vault}) if vault else 0
-        st.markdown(
-            f"""<span class="tf-stat-chip">{unique_artists}<span>artists</span></span>""",
-            unsafe_allow_html=True,
-        )
+    unique_artists = len({t["Artist"] for t in vault}) if vault else 0
+    st.markdown(
+        f"""
+        <div style="display:flex; flex-wrap:wrap; gap:0.5rem;">
+            <span class="tf-stat-chip">{len(vault)}<span>tracks</span></span>
+            <span class="tf-stat-chip">{unique_artists}<span>artists</span></span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -1749,7 +1844,7 @@ with col_queue:
         st.markdown(
             """
             <div class="tf-empty-state">
-                Your collection is empty. Add tracks from the feed to build your queue.
+                Your playlist is empty. Add songs from recommendations to build your custom playlist.
             </div>
             """,
             unsafe_allow_html=True,
@@ -1760,20 +1855,28 @@ with col_queue:
             thumb_url = track.get("thumbnail_url", "")
             row_class = "tf-collection-row tf-collection-row-active" if is_current else "tf-collection-row"
             now_tag = '<span class="tf-now-playing-tag">Playing</span>' if is_current else ""
+            thumb_html = (
+                f'<img class="tf-thumb" src="{thumb_url}" alt="">'
+                if thumb_url
+                else '<div class="tf-thumb-placeholder">&#9834;</div>'
+            )
 
-            r_thumb, r_text, r_play, r_up, r_down, r_del = st.columns([0.5, 2.6, 0.5, 0.42, 0.42, 0.5])
-            with r_thumb:
-                if thumb_url:
-                    st.markdown(
-                        f'<img class="tf-thumb" src="{thumb_url}" alt="">',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown('<div class="tf-thumb-placeholder">&#9834;</div>', unsafe_allow_html=True)
-            with r_text:
+            # [MOBILE LAYOUT FIX] st.columns forces its children to stack
+            # vertically below Streamlit's mobile breakpoint — on a phone,
+            # this row used to break into 6 separate stacked lines
+            # (thumbnail, title, artist, then each button on its own line),
+            # taking up enormous vertical space for a single track.
+            # st.container(horizontal=True) is a true CSS flex row that
+            # sizes each child to its own content instead of dividing the
+            # width into fixed column proportions, and does not carry the
+            # same forced-stack-on-mobile behavior, so the thumbnail, the
+            # title/artist block, and the four action buttons all stay on
+            # one compact horizontal line at any viewport width.
+            with st.container(horizontal=True, gap="small", vertical_alignment="center"):
                 st.markdown(
                     f"""
-                    <div class="{row_class}" style="padding-left:0.5rem;">
+                    <div class="{row_class}" style="flex:1; min-width:0;">
+                        {thumb_html}
                         <div class="tf-collection-text">
                             <span class="tf-collection-title">{track.get('Song','')}</span>
                             <span class="tf-collection-artist">{track.get('Artist','')} {now_tag}</span>
@@ -1782,19 +1885,15 @@ with col_queue:
                     """,
                     unsafe_allow_html=True,
                 )
-            with r_play:
                 if st.button("\u25B6", key=f"vault_play_{i}", help="Play this track"):
                     load_queue_track(i)
                     st.rerun()
-            with r_up:
                 if st.button("\u25B2", key=f"vault_up_{i}", help="Move up", disabled=(i == 0)):
                     move_track_in_vault(i, -1)
                     st.rerun()
-            with r_down:
                 if st.button("\u25BC", key=f"vault_down_{i}", help="Move down", disabled=(i == len(vault) - 1)):
                     move_track_in_vault(i, 1)
                     st.rerun()
-            with r_del:
                 if st.button("\u2715", key=f"vault_remove_{i}", help="Remove"):
                     remove_from_playlist(i)
                     st.rerun()
@@ -1819,6 +1918,7 @@ with col_queue:
 
     uploaded_vault = st.file_uploader(
         "Restore a saved collection",
+        type=["json"],
         label_visibility="collapsed",
         key="vault_resume_uploader",
     )
@@ -1826,10 +1926,16 @@ with col_queue:
         already_processed = st.session_state.get("_last_restored_upload_id")
         upload_id = f"{uploaded_vault.name}_{uploaded_vault.size}"
         if already_processed != upload_id:
-            success, message = restore_playlist_from_file(uploaded_vault.read(), uploaded_vault.name)
+            uploaded_bytes = uploaded_vault.read()
+            success, message = restore_playlist_from_file(uploaded_bytes, uploaded_vault.name)
+            # Reset the cached resolution markers tied to whatever was
+            # playing before the restore, so the player doesn't keep
+            # showing stale auto-generation/queue state from before this
+            # backup was loaded.
             st.session_state["_last_restored_upload_id"] = upload_id
+            st.session_state["_last_auto_generated_fingerprint"] = None
             if success:
-                st.success(message)
+                st.toast(message, icon="\u2705")
                 st.rerun()
             else:
                 st.error(message)
@@ -1914,6 +2020,30 @@ with col_discover:
     # -------------------- DISCOVER --------------------
     st.markdown('<div class="tf-card">', unsafe_allow_html=True)
     st.markdown('<div class="tf-card-title">Discover</div>', unsafe_allow_html=True)
+
+    # [BUG FIX] Restore the Source selector if (and only if) the PREVIOUS
+    # pass never reached the end of col_discover at all — see
+    # PREVIOUS_PASS_COMPLETED_DISCOVER, computed at the true top of the
+    # script before either column ran this pass. This specifically targets
+    # the "Add to Playlist (or any other col_queue action) silently flips
+    # the radio back to its default" bug: col_queue executes first, and
+    # any st.rerun() inside it cuts the script off before this radio has
+    # rendered at all on that pass, which can reset its bound session
+    # state to the widget's declared default by the next pass. On a clean
+    # pass (the normal case for any real user interaction, including with
+    # this exact radio), the previous pass DID complete col_discover, so
+    # this restoration never runs and a genuine click is never overridden.
+    if not PREVIOUS_PASS_COMPLETED_DISCOVER and "_last_input_mode" in st.session_state:
+        # Don't gate this on "does input_mode_radio currently differ from
+        # _last_input_mode" — the same interruption that resets the
+        # radio's own widget value can ALSO prevent the code that keeps
+        # _last_input_mode in sync from running at all on the corrupted
+        # pass, so both can end up reset to the same wrong default
+        # together, and a difference-based check would never fire. Once
+        # we know for certain the previous pass was cut short before
+        # reaching here, restore unconditionally — _last_input_mode is the
+        # trusted value either way.
+        st.session_state["input_mode_radio"] = st.session_state["_last_input_mode"]
 
     input_mode = st.radio(
         "Source",
@@ -2115,6 +2245,18 @@ with col_discover:
                         "video_id": seed.video_id,
                     }
 
+                # [BUG FIX] col_queue (the "Now Playing" player) is declared
+                # and rendered BEFORE col_discover in script execution order
+                # — so on the run where a brand-new link is parsed, the
+                # player has already rendered using the OLD now_playing by
+                # the time this code updates it. Without forcing another
+                # pass, the new video only appears once some unrelated
+                # widget (e.g. the slider) triggers the next rerun. This
+                # rerun is safe to call unconditionally here: on the
+                # following pass, _last_parsed_url already equals yt_url,
+                # so this whole block is skipped and no rerun loop occurs.
+                st.rerun()
+
             parsed = st.session_state.get("_last_parsed_seed", {})
             seed_video_id = parsed.get("video_id", "")
 
@@ -2238,6 +2380,13 @@ with col_discover:
             """,
             unsafe_allow_html=True,
         )
+
+    # col_discover reached its true end without being interrupted by a
+    # rerun from anywhere inside col_queue — mark this pass as having
+    # completed cleanly so the NEXT pass's restoration check (see the top
+    # of this file, before the columns are declared) correctly skips
+    # restoring the radio, leaving any genuine click on it untouched.
+    st.session_state["_col_discover_completed_last_pass"] = True
 
 
 # ===========================================================================
