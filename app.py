@@ -103,6 +103,27 @@ CHANGELOG (this revision — alignment, responsive, and parsing fixes):
               hidden entirely (not just disabled) when
               current_queue_index is None, instead of always rendering in
               a grayed-out state with no active queue context.
+
+CHANGELOG (this revision — backup uploader state-sync fixes):
+    [BUG FIX] A successful restore now shows a one-shot "Success: Loaded N
+              tracks into your session!" banner right above the uploader,
+              cleared after a single render so it never lingers. Without
+              this, the uploader kept showing the picked filename and the
+              collection stats updated silently underneath it, which could
+              look like nothing had happened even though the restore
+              worked.
+    [BUG FIX] The uploader's key is now driven by a monotonically
+              increasing "uploader_epoch" counter (advanced on every
+              successful restore AND every Clear Playlist action) instead
+              of a fixed key. This gives the widget a genuinely fresh
+              identity each time — note this is deliberately a counter,
+              not a key derived from collection length, since length can
+              cycle back to a previously-seen value (e.g. clear then
+              re-upload), which would reintroduce the exact "same file
+              silently ignored" bug this was meant to fix. Clearing the
+              playlist also resets the upload-dedup marker, so a backup
+              file that was already restored once can be uploaded again
+              immediately afterward without a hard browser refresh.
 """
 
 import os
@@ -732,6 +753,8 @@ def init_session_state():
         "auto_generate_enabled": True,  # auto-generate recommendations on seed confirm
         "_last_auto_generated_fingerprint": None,  # guards against re-triggering on every rerun
         "_last_restored_upload_id": None,  # guards against re-importing the same backup file every rerun
+        "uploader_epoch": 0,  # advances on every successful restore and every Clear Playlist, forcing a fresh uploader widget identity
+        "upload_success_message": None,  # one-shot banner text, shown once then cleared
         "current_queue_index": None,    # index into playlist_vault for Next/Previous — None when playback isn't sourced from the queue
         "confirm_clear_pending": False,  # tracks the single-click-then-confirm flow for Clear Playlist
         "_col_discover_completed_last_pass": True,  # tracks whether col_discover finished cleanly last pass, for the radio-restoration fix
@@ -1610,18 +1633,19 @@ def restore_playlist_from_file(uploaded_bytes: bytes, filename: str = "") -> tup
     Parses a previously-downloaded backup file and restores it into the
     current session's collection — merging with, not replacing, anything
     already saved (duplicates by Song+Artist are skipped). Returns
-    (success, message). Tracks from the older export format (version 1,
-    with a legacy "Reason" string instead of MatchingAttributes) are
-    restored as-is; get_track_attributes() reads either format gracefully.
+    (success, message, added_count). Tracks from the older export format
+    (version 1, with a legacy "Reason" string instead of MatchingAttributes)
+    are restored as-is; get_track_attributes() reads either format
+    gracefully.
     """
     try:
         data = json.loads(uploaded_bytes.decode("utf-8"))
     except Exception:
-        return False, "That file couldn't be read — try downloading a fresh backup and uploading that."
+        return False, "That file couldn't be read — try downloading a fresh backup and uploading that.", 0
 
     tracks = data.get("playlist_vault")
     if not isinstance(tracks, list):
-        return False, "That file doesn't contain a recognizable collection."
+        return False, "That file doesn't contain a recognizable collection.", 0
 
     existing = {(t.get("Song", "").lower(), t.get("Artist", "").lower()) for t in st.session_state.playlist_vault}
     added = 0
@@ -1635,8 +1659,8 @@ def restore_playlist_from_file(uploaded_bytes: bytes, filename: str = "") -> tup
             added += 1
 
     if added == 0:
-        return True, "No new tracks to add — everything in that file is already in your collection."
-    return True, f"Restored {added} track{'s' if added != 1 else ''}."
+        return True, "No new tracks to add — everything in that file is already in your collection.", 0
+    return True, f"Restored {added} track{'s' if added != 1 else ''}.", added
 
 
 # ===========================================================================
@@ -1916,18 +1940,42 @@ with col_queue:
         )
         st.markdown("<br>", unsafe_allow_html=True)
 
+    # [BUG FIX 1] Show a one-shot success banner right above the uploader
+    # when a restore just completed. Without this, the uploader widget
+    # keeps displaying the picked filename and the collection stats update
+    # silently underneath it — easy to mistake for a no-op even though the
+    # restore genuinely worked. Cleared immediately after being shown once,
+    # so it never lingers stuck on screen across later reruns.
+    pending_upload_message = st.session_state.get("upload_success_message")
+    if pending_upload_message:
+        st.success(pending_upload_message)
+        st.session_state["upload_success_message"] = None
+
+    # [BUG FIX 2] Drive the uploader's key from a monotonically-increasing
+    # counter instead of a fixed string. A plain fixed key (or one derived
+    # from something that can repeat, like len(playlist_vault) — which
+    # cycles back to the same value after Clear Playlist empties the list
+    # again) leaves Streamlit's file_uploader treating a second upload of
+    # the exact same file as "already seen", so nothing happens until a
+    # hard browser refresh. Advancing this counter on every successful
+    # restore AND every Clear Playlist action gives the widget a genuinely
+    # new identity each time, never reusing a key the same file could have
+    # been associated with before — unblocking immediate re-upload of the
+    # exact same backup file.
+    uploader_key = f"vault_resume_uploader_{st.session_state.get('uploader_epoch', 0)}"
+
     uploaded_vault = st.file_uploader(
         "Restore a saved collection",
         type=["json"],
         label_visibility="collapsed",
-        key="vault_resume_uploader",
+        key=uploader_key,
     )
     if uploaded_vault is not None:
         already_processed = st.session_state.get("_last_restored_upload_id")
         upload_id = f"{uploaded_vault.name}_{uploaded_vault.size}"
         if already_processed != upload_id:
             uploaded_bytes = uploaded_vault.read()
-            success, message = restore_playlist_from_file(uploaded_bytes, uploaded_vault.name)
+            success, message, added_count = restore_playlist_from_file(uploaded_bytes, uploaded_vault.name)
             # Reset the cached resolution markers tied to whatever was
             # playing before the restore, so the player doesn't keep
             # showing stale auto-generation/queue state from before this
@@ -1935,6 +1983,18 @@ with col_queue:
             st.session_state["_last_restored_upload_id"] = upload_id
             st.session_state["_last_auto_generated_fingerprint"] = None
             if success:
+                if added_count > 0:
+                    st.session_state["upload_success_message"] = (
+                        f"Success: Loaded {added_count} track{'s' if added_count != 1 else ''} into your session!"
+                    )
+                else:
+                    st.session_state["upload_success_message"] = message
+                # Advance the uploader's key so it presents as a brand-new,
+                # empty widget on the next render — this both clears the
+                # visible filename (bug fix 1) and frees up the same file
+                # to be re-uploaded again later without a hard refresh
+                # (bug fix 2).
+                st.session_state["uploader_epoch"] = st.session_state.get("uploader_epoch", 0) + 1
                 st.toast(message, icon="\u2705")
                 st.rerun()
             else:
@@ -1994,6 +2054,14 @@ with col_queue:
                 st.session_state.playlist_vault = []
                 st.session_state.confirm_clear_pending = False
                 st.session_state.current_queue_index = None
+                # [BUG FIX 2] Advance the uploader's epoch here too, and
+                # clear the dedup marker tied to whatever was last
+                # restored. Without this, a file already restored once
+                # would still be recognized as "already processed" if the
+                # exact same upload_id resurfaced after the playlist was
+                # cleared and the same backup file was picked again.
+                st.session_state["uploader_epoch"] = st.session_state.get("uploader_epoch", 0) + 1
+                st.session_state["_last_restored_upload_id"] = None
                 st.toast("Playlist cleared.")
             else:
                 st.session_state.confirm_clear_pending = True
